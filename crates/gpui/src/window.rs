@@ -1041,6 +1041,11 @@ pub struct Window {
     /// emitted yet. AccessKit requires the `tree` field be set on the
     /// initial update; subsequent updates may set it to `None`.
     a11y_tree_initialized: bool,
+    /// Snapshot of the last-emitted accessibility tree (synthetic root
+    /// + collected nodes). Diffed against the next frame's snapshot
+    /// to compute a minimal `TreeUpdate` rather than re-emitting
+    /// everything every dirty frame.
+    last_a11y_nodes: std::collections::HashMap<accesskit::NodeId, accesskit::Node>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1663,6 +1668,7 @@ impl Window {
             accessibility_handler: None,
             platform_accessibility_handler,
             a11y_tree_initialized: false,
+            last_a11y_nodes: std::collections::HashMap::new(),
         })
     }
 
@@ -1743,6 +1749,11 @@ impl Window {
     /// Called once per frame at `draw()` finalization, after all
     /// elements have painted. No-op if there are no pending nodes
     /// or no handlers.
+    ///
+    /// Diffs the new full tree against the last snapshot so subsequent
+    /// frames emit only changed nodes — for static UIs that's an
+    /// empty `nodes` vec post-init, with the `last_a11y_nodes`
+    /// snapshot still updated.
     fn drain_accessibility_tree(&mut self) {
         if self.pending_a11y_nodes.is_empty() {
             return;
@@ -1751,9 +1762,14 @@ impl Window {
             self.pending_a11y_nodes.clear();
             return;
         }
-        let nodes = std::mem::take(&mut self.pending_a11y_nodes);
+        let collected = std::mem::take(&mut self.pending_a11y_nodes);
+        let current = crate::accessibility::full_tree(collected);
         let declare_tree = !self.a11y_tree_initialized;
-        let update = crate::accessibility::build_tree_update(nodes, declare_tree);
+        let update = crate::accessibility::diff_tree_update(
+            &current,
+            &self.last_a11y_nodes,
+            declare_tree,
+        );
         // Both handlers receive the same update. TreeUpdate is Clone;
         // the platform handler runs after the user handler so the
         // user can observe before the platform does anything with it.
@@ -1763,6 +1779,7 @@ impl Window {
         if let Some(handler) = self.platform_accessibility_handler.as_mut() {
             handler(update);
         }
+        self.last_a11y_nodes = current;
         self.a11y_tree_initialized = true;
     }
 
