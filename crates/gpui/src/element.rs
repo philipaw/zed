@@ -512,6 +512,13 @@ impl<E: Element> Drawable<E> {
                 // `id()` (anonymous element → no path → no NodeId we can
                 // derive). The default `accessibility()` returns `None`,
                 // so this is a no-op for elements that haven't opted in.
+                //
+                // AnyElement-wrapped elements propagate through this call
+                // site automatically: AnyElement::paint forwards through
+                // ElementObject::paint to the inner Drawable<E>::paint
+                // (which is this method, instantiated for the typed E).
+                // No explicit ElementObject::accessibility forwarder is
+                // needed because the recursion handles it.
                 if let Some(global_id) = global_id.as_ref() {
                     if let Some(node) = self.element.accessibility(
                         Some(global_id),
