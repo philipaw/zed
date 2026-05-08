@@ -285,6 +285,12 @@ unsafe fn build_classes() {
                     accepts_first_mouse as extern "C" fn(&Object, Sel, id) -> BOOL,
                 );
 
+                // NB: NSAccessibility selectors are not added here.
+                // accesskit_macos::SubclassingAdapter dynamically
+                // subclasses the NSView at construction and intercepts
+                // them itself — see §10.4 Layer 2.
+
+
                 decl.add_method(
                     sel!(characterIndexForPoint:),
                     character_index_for_point as extern "C" fn(&Object, Sel, NSPoint) -> u64,
@@ -471,14 +477,21 @@ struct MacWindowState {
     background_executor: BackgroundExecutor,
     native_window: id,
     native_view: NonNull<Object>,
-    /// §10.4 Layer 2: AccessKit ↔ NSAccessibility adapter. Constructed
-    /// at window creation with the native_view pointer; receives
-    /// `accesskit::TreeUpdate`s from gpui core via Window's
-    /// `set_accessibility_handler` hook (wired in a subsequent commit),
-    /// and routes NSAccessibility queries from the GPUIView class
-    /// (also a subsequent commit). For now it just exists.
-    #[allow(dead_code)] // wired in a subsequent Layer-2 commit
-    a11y_adapter: accesskit_macos::Adapter,
+    /// §10.4 Layer 2: AccessKit ↔ NSAccessibility subclassing adapter.
+    /// `SubclassingAdapter` dynamically subclasses the NSView at
+    /// construction and intercepts `accessibilityChildren` /
+    /// `accessibilityFocusedUIElement` / `accessibilityHitTest:`
+    /// itself — we don't manually override those selectors. We feed
+    /// it `TreeUpdate`s from gpui core via the platform handler
+    /// installed by `take_accessibility_handler`.
+    a11y_adapter: accesskit_macos::SubclassingAdapter,
+    /// Shared cache between the platform handler closure (writer) and
+    /// `WindowActivationHandler::request_initial_tree` (reader). The
+    /// activation handler is consumed by the adapter at construction
+    /// — it can't be mutated externally — so the closure writes here
+    /// and the activation handler reads from here when AT first
+    /// activates.
+    a11y_state: Arc<Mutex<A11yState>>,
     blurred_view: Option<id>,
     background_appearance: WindowBackgroundAppearance,
     cursor_style: CursorStyle,
@@ -679,6 +692,31 @@ impl accesskit::ActionHandler for NoopActionHandler {
     }
 }
 
+/// §10.4 Layer 2 shared state between the platform handler closure
+/// and the activation handler stored inside `SubclassingAdapter`. The
+/// closure writes the FIRST TreeUpdate here (which has `tree: Some`
+/// + a full nodes list — the only kind suitable for accesskit's
+/// initialization). The activation handler reads it when AT first
+/// activates the tree.
+#[derive(Default)]
+struct A11yState {
+    initial_update: Option<accesskit::TreeUpdate>,
+}
+
+/// Activation handler owned by the `SubclassingAdapter`. Reads the
+/// initial TreeUpdate from the shared `A11yState` lazily, when AT
+/// activates the tree for the first time.
+struct WindowActivationHandler {
+    state: Arc<Mutex<A11yState>>,
+}
+
+impl accesskit::ActivationHandler for WindowActivationHandler {
+    fn request_initial_tree(&mut self) -> Option<accesskit::TreeUpdate> {
+        self.state.lock().initial_update.clone()
+    }
+}
+
+
 pub(crate) struct MacWindow(Arc<Mutex<MacWindowState>>);
 
 impl MacWindow {
@@ -807,13 +845,25 @@ impl MacWindow {
             let native_view = NSView::initWithFrame_(native_view, NSView::bounds(content_view));
             assert!(!native_view.is_null());
 
-            // §10.4 Layer 2: spin up the accesskit_macos Adapter on the
-            // GPUIView. unsafe fn — the view pointer must outlive the
-            // adapter, which holds true because both live on the
-            // MacWindowState we're constructing right below.
-            let a11y_adapter = accesskit_macos::Adapter::new(
+            // §10.4 Layer 2: spin up the accesskit_macos
+            // SubclassingAdapter on the GPUIView. The adapter
+            // dynamically subclasses the NSView and intercepts the
+            // NSAccessibility query selectors (accessibilityChildren,
+            // accessibilityFocusedUIElement, accessibilityHitTest:)
+            // itself — we don't manually add those selectors to
+            // GPUIView. The activation handler closes over a shared
+            // A11yState so we can write the initial TreeUpdate from
+            // gpui's drain even though the activation handler is
+            // owned by the adapter at this point.
+            //
+            // unsafe fn — the view pointer must outlive the adapter,
+            // which holds because both live on MacWindowState.
+            let a11y_state: Arc<Mutex<A11yState>> = Arc::new(Mutex::new(A11yState::default()));
+            let a11y_adapter = accesskit_macos::SubclassingAdapter::new(
                 native_view as *mut c_void,
-                false, // is_view_focused: initial — focus state will be tracked separately
+                WindowActivationHandler {
+                    state: a11y_state.clone(),
+                },
                 NoopActionHandler,
             );
 
@@ -824,6 +874,7 @@ impl MacWindow {
                 native_window,
                 native_view: NonNull::new_unchecked(native_view),
                 a11y_adapter,
+                a11y_state,
                 blurred_view: None,
                 background_appearance: WindowBackgroundAppearance::Opaque,
                 cursor_style: CursorStyle::Arrow,
@@ -1301,18 +1352,29 @@ impl PlatformWindow for MacWindow {
     fn take_accessibility_handler(
         &mut self,
     ) -> Option<Box<dyn FnMut(accesskit::TreeUpdate) + Send + 'static>> {
-        // §10.4 Layer 2: hand gpui core a closure that locks our
-        // MacWindowState and feeds the accesskit_macos::Adapter via
-        // `update_if_active`. The Adapter still needs its NSView
-        // accessibility methods routed (subsequent sub-commit) before
-        // anything's visible to VoiceOver / Accessibility Inspector,
-        // but this gets the data flowing.
+        // §10.4 Layer 2: closure feeds the SubclassingAdapter.
+        //
+        // Only the FIRST update is stashed in a11y_state. gpui's
+        // first emission has `tree: Some` plus a full nodes list —
+        // exactly what accesskit_consumer's Tree::new needs to
+        // initialize. Subsequent emissions are diffs (empty nodes,
+        // tree: None); using them as initializers panics validate_global
+        // ("Root ID is not in the node list"). Once initialized, the
+        // adapter applies subsequent diffs incrementally via
+        // update_if_active without re-consulting the activation
+        // handler.
         let state = self.0.clone();
-        Some(Box::new(move |update| {
-            let mut state = state.as_ref().lock();
+        Some(Box::new(move |update: accesskit::TreeUpdate| {
+            let mut win = state.as_ref().lock();
+            {
+                let mut a11y = win.a11y_state.lock();
+                if a11y.initial_update.is_none() {
+                    a11y.initial_update = Some(update.clone());
+                }
+            }
             // QueuedEvents discarded for now; AT-action processing is
             // a follow-up.
-            let _ = state.a11y_adapter.update_if_active(|| update);
+            let _ = win.a11y_adapter.update_if_active(|| update);
         }))
     }
 
