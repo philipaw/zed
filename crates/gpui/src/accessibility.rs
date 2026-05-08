@@ -84,6 +84,18 @@ pub(crate) fn diff_tree_update(
             .collect()
     };
 
+    // Focus mapping (Layer 1 (e)) is a follow-up. For now we pick the
+    // first collected child as the focus sentinel — accesskit_consumer
+    // panics in validate_global if focus points at a node that isn't
+    // in the live tree, and root-as-sentinel doesn't survive its
+    // graft-chain walk reliably across versions. Picking a real leaf
+    // sidesteps that until proper focus mapping lands.
+    let focus = current
+        .keys()
+        .find(|id| **id != A11Y_ROOT_ID)
+        .copied()
+        .unwrap_or(A11Y_ROOT_ID);
+
     accesskit::TreeUpdate {
         nodes,
         tree: if declare_tree {
@@ -92,8 +104,7 @@ pub(crate) fn diff_tree_update(
             None
         },
         tree_id: accesskit::TreeId::ROOT,
-        // Focus mapping is a follow-up; for now point at the root.
-        focus: A11Y_ROOT_ID,
+        focus,
     }
 }
 
@@ -150,7 +161,8 @@ mod tests {
         assert_eq!(update.tree.as_ref().unwrap().root, A11Y_ROOT_ID);
         // Synthetic root + the one pushed child.
         assert_eq!(update.nodes.len(), 2);
-        assert_eq!(update.focus, A11Y_ROOT_ID);
+        // Focus is the first non-root collected node (the button).
+        assert_eq!(update.focus, accesskit::NodeId::from(42u64));
     }
 
     #[test]
