@@ -103,6 +103,32 @@ pub trait Element: 'static + IntoElement {
         cx: &mut App,
     );
 
+    /// Project this element into an AccessKit node so platform accessibility
+    /// adapters (NSAccessibility, UIAccessibility, AT-SPI, UIA) can expose
+    /// it to assistive technologies. Default returns `None` — elements
+    /// without semantic content are invisible to a11y. Buttons, text,
+    /// images, and structurally-significant containers should override.
+    ///
+    /// Called once per dirty frame, between [`Element::prepaint`] and
+    /// [`Element::paint`], with the same id/inspector_id/bounds/state args
+    /// (shared references — projection is read-only). The framework
+    /// collects returned nodes into the window's a11y tree and emits a
+    /// diffed [`accesskit::TreeUpdate`] to the registered handler at
+    /// frame finish.
+    fn accessibility(
+        &self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        request_layout: &Self::RequestLayoutState,
+        prepaint: &Self::PrepaintState,
+        window: &Window,
+        cx: &App,
+    ) -> Option<accesskit::Node> {
+        let _ = (id, inspector_id, bounds, request_layout, prepaint, window, cx);
+        None
+    }
+
     /// Convert this element into a dynamically-typed [`AnyElement`].
     fn into_any(self) -> AnyElement {
         AnyElement::new(self)

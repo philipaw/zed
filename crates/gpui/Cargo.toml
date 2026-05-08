@@ -45,6 +45,7 @@ path = "src/gpui.rs"
 doctest = false
 
 [dependencies]
+accesskit = "0.24"
 anyhow.workspace = true
 async-task = "4.7"
 backtrace = { workspace = true, optional = true }
