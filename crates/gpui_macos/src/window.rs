@@ -471,6 +471,14 @@ struct MacWindowState {
     background_executor: BackgroundExecutor,
     native_window: id,
     native_view: NonNull<Object>,
+    /// §10.4 Layer 2: AccessKit ↔ NSAccessibility adapter. Constructed
+    /// at window creation with the native_view pointer; receives
+    /// `accesskit::TreeUpdate`s from gpui core via Window's
+    /// `set_accessibility_handler` hook (wired in a subsequent commit),
+    /// and routes NSAccessibility queries from the GPUIView class
+    /// (also a subsequent commit). For now it just exists.
+    #[allow(dead_code)] // wired in a subsequent Layer-2 commit
+    a11y_adapter: accesskit_macos::Adapter,
     blurred_view: Option<id>,
     background_appearance: WindowBackgroundAppearance,
     cursor_style: CursorStyle,
@@ -657,6 +665,20 @@ impl MacWindowState {
 
 unsafe impl Send for MacWindowState {}
 
+/// §10.4 Layer 2: stub ActionHandler. AccessKit invokes this when an
+/// AT (VoiceOver, etc.) requests an action against a node — clicks,
+/// focus changes, etc. The no-op landed in this commit gets the
+/// adapter alive without yet routing actions back to gpui's input
+/// system. A subsequent commit will translate `ActionRequest`s into
+/// gpui events.
+struct NoopActionHandler;
+
+impl accesskit::ActionHandler for NoopActionHandler {
+    fn do_action(&mut self, _request: accesskit::ActionRequest) {
+        // TODO(Layer 2 follow-up): route to gpui's input system.
+    }
+}
+
 pub(crate) struct MacWindow(Arc<Mutex<MacWindowState>>);
 
 impl MacWindow {
@@ -785,12 +807,23 @@ impl MacWindow {
             let native_view = NSView::initWithFrame_(native_view, NSView::bounds(content_view));
             assert!(!native_view.is_null());
 
+            // §10.4 Layer 2: spin up the accesskit_macos Adapter on the
+            // GPUIView. unsafe fn — the view pointer must outlive the
+            // adapter, which holds true because both live on the
+            // MacWindowState we're constructing right below.
+            let a11y_adapter = accesskit_macos::Adapter::new(
+                native_view as *mut c_void,
+                false, // is_view_focused: initial — focus state will be tracked separately
+                NoopActionHandler,
+            );
+
             let mut window = Self(Arc::new(Mutex::new(MacWindowState {
                 handle,
                 foreground_executor,
                 background_executor,
                 native_window,
                 native_view: NonNull::new_unchecked(native_view),
+                a11y_adapter,
                 blurred_view: None,
                 background_appearance: WindowBackgroundAppearance::Opaque,
                 cursor_style: CursorStyle::Arrow,
