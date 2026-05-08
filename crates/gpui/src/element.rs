@@ -506,6 +506,27 @@ impl<E: Element> Drawable<E> {
                 }
 
                 window.next_frame.dispatch_tree.set_active_node(node_id);
+
+                // §10.4 Layer 1: project this element into the window's
+                // accessibility tree. Skipped when the element has no
+                // `id()` (anonymous element → no path → no NodeId we can
+                // derive). The default `accessibility()` returns `None`,
+                // so this is a no-op for elements that haven't opted in.
+                if let Some(global_id) = global_id.as_ref() {
+                    if let Some(node) = self.element.accessibility(
+                        Some(global_id),
+                        inspector_id.as_ref(),
+                        bounds,
+                        &request_layout,
+                        &prepaint,
+                        window,
+                        cx,
+                    ) {
+                        let node_id = crate::accessibility::node_id_from_global(global_id);
+                        window.push_accessibility_node(node_id, node);
+                    }
+                }
+
                 self.element.paint(
                     global_id.as_ref(),
                     inspector_id.as_ref(),

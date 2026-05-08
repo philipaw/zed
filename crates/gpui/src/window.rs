@@ -1021,6 +1021,19 @@ pub struct Window {
     captured_hitbox: Option<HitboxId>,
     #[cfg(any(feature = "inspector", debug_assertions))]
     inspector: Option<Entity<Inspector>>,
+    /// Per-frame buffer of `(NodeId, Node)` pairs pushed by element
+    /// `accessibility()` impls during paint. Drained at frame finish
+    /// into a `TreeUpdate` for the registered handler. See
+    /// `set_accessibility_handler`.
+    pub(crate) pending_a11y_nodes: Vec<(accesskit::NodeId, accesskit::Node)>,
+    /// Optional handler subscribed by a platform a11y adapter
+    /// (NSAccessibility/UIAccessibility/AT-SPI/UIA). Receives one
+    /// `TreeUpdate` per dirty frame in which any element pushed a node.
+    accessibility_handler: Option<Box<dyn FnMut(accesskit::TreeUpdate) + Send + 'static>>,
+    /// Tracks whether the first `TreeUpdate` for this Window has been
+    /// emitted yet. AccessKit requires the `tree` field be set on the
+    /// initial update; subsequent updates may set it to `None`.
+    a11y_tree_initialized: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1633,6 +1646,9 @@ impl Window {
             captured_hitbox: None,
             #[cfg(any(feature = "inspector", debug_assertions))]
             inspector: None,
+            pending_a11y_nodes: Vec::new(),
+            accessibility_handler: None,
+            a11y_tree_initialized: false,
         })
     }
 
@@ -1677,6 +1693,54 @@ impl ContentMask<Pixels> {
 }
 
 impl Window {
+    /// Subscribe a platform accessibility adapter to this window's
+    /// projected accessibility tree. The handler is invoked once per
+    /// frame in which any element's [`Element::accessibility`] returned
+    /// `Some(node)`, with a single [`accesskit::TreeUpdate`] containing
+    /// the full collected tree (no diffing yet — see §10.4).
+    ///
+    /// Replaces any previously-set handler. Re-emits the `TreeUpdate::tree`
+    /// initialization field on the first update after this call (the
+    /// new adapter needs the root declaration).
+    pub fn set_accessibility_handler(
+        &mut self,
+        handler: Box<dyn FnMut(accesskit::TreeUpdate) + Send + 'static>,
+    ) {
+        self.accessibility_handler = Some(handler);
+        self.a11y_tree_initialized = false;
+    }
+
+    /// Push an `(id, node)` pair into the per-frame accessibility
+    /// buffer. Called by the framework's element paint cycle when an
+    /// element's [`Element::accessibility`] returns `Some(node)`. No
+    /// effect if no handler is registered (the buffer drains with the
+    /// frame either way).
+    pub(crate) fn push_accessibility_node(
+        &mut self,
+        id: accesskit::NodeId,
+        node: accesskit::Node,
+    ) {
+        self.pending_a11y_nodes.push((id, node));
+    }
+
+    /// Drain the per-frame accessibility buffer into a `TreeUpdate`
+    /// and call the registered handler. Called once per frame at
+    /// `draw()` finalization, after all elements have painted. No-op
+    /// if there's no handler or no pending nodes.
+    fn drain_accessibility_tree(&mut self) {
+        if self.pending_a11y_nodes.is_empty() {
+            return;
+        }
+        let nodes = std::mem::take(&mut self.pending_a11y_nodes);
+        let Some(handler) = self.accessibility_handler.as_mut() else {
+            return;
+        };
+        let declare_tree = !self.a11y_tree_initialized;
+        let update = crate::accessibility::build_tree_update(nodes, declare_tree);
+        handler(update);
+        self.a11y_tree_initialized = true;
+    }
+
     fn mark_view_dirty(&mut self, view_id: EntityId) {
         // Mark ancestor views as dirty. If already in the `dirty_views` set, then all its ancestors
         // should already be dirty.
@@ -2518,6 +2582,7 @@ impl Window {
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
         self.next_frame.clear();
+        self.drain_accessibility_tree();
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;
 
