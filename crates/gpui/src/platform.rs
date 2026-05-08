@@ -615,6 +615,17 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn capslock(&self) -> Capslock;
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler);
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler>;
+    /// §10.4 Layer 2: hand off this platform's accessibility-handler
+    /// closure to the gpui core `Window`, which calls it on each
+    /// dirty frame's `TreeUpdate` drain. Default returns `None` for
+    /// platforms that don't yet have an AccessKit adapter wired up;
+    /// macOS overrides this to return a closure that captures the
+    /// `accesskit_macos::Adapter` and calls `update_if_active`.
+    fn take_accessibility_handler(
+        &mut self,
+    ) -> Option<Box<dyn FnMut(accesskit::TreeUpdate) + Send + 'static>> {
+        None
+    }
     fn prompt(
         &self,
         level: PromptLevel,

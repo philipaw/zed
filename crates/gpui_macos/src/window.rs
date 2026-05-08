@@ -1298,6 +1298,24 @@ impl PlatformWindow for MacWindow {
         self.0.as_ref().lock().input_handler.take()
     }
 
+    fn take_accessibility_handler(
+        &mut self,
+    ) -> Option<Box<dyn FnMut(accesskit::TreeUpdate) + Send + 'static>> {
+        // §10.4 Layer 2: hand gpui core a closure that locks our
+        // MacWindowState and feeds the accesskit_macos::Adapter via
+        // `update_if_active`. The Adapter still needs its NSView
+        // accessibility methods routed (subsequent sub-commit) before
+        // anything's visible to VoiceOver / Accessibility Inspector,
+        // but this gets the data flowing.
+        let state = self.0.clone();
+        Some(Box::new(move |update| {
+            let mut state = state.as_ref().lock();
+            // QueuedEvents discarded for now; AT-action processing is
+            // a follow-up.
+            let _ = state.a11y_adapter.update_if_active(|| update);
+        }))
+    }
+
     fn prompt(
         &self,
         level: PromptLevel,

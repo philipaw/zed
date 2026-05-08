@@ -1026,10 +1026,17 @@ pub struct Window {
     /// into a `TreeUpdate` for the registered handler. See
     /// `set_accessibility_handler`.
     pub(crate) pending_a11y_nodes: Vec<(accesskit::NodeId, accesskit::Node)>,
-    /// Optional handler subscribed by a platform a11y adapter
-    /// (NSAccessibility/UIAccessibility/AT-SPI/UIA). Receives one
-    /// `TreeUpdate` per dirty frame in which any element pushed a node.
+    /// User-set observer handler. Receives one `TreeUpdate` per dirty
+    /// frame in which any element pushed a node. Useful for testing
+    /// and inspection; doesn't replace the platform-installed handler
+    /// below — both fire when both are set.
     accessibility_handler: Option<Box<dyn FnMut(accesskit::TreeUpdate) + Send + 'static>>,
+    /// Platform-installed handler set during `Window::new` from
+    /// `PlatformWindow::take_accessibility_handler`. On macOS this
+    /// holds a closure that feeds `accesskit_macos::Adapter::update_if_active`;
+    /// other platforms get `None` until they implement the trait method.
+    platform_accessibility_handler:
+        Option<Box<dyn FnMut(accesskit::TreeUpdate) + Send + 'static>>,
     /// Tracks whether the first `TreeUpdate` for this Window has been
     /// emitted yet. AccessKit requires the `tree` field be set on the
     /// initial update; subsequent updates may set it to `None`.
@@ -1586,6 +1593,12 @@ impl Window {
 
         platform_window.map_window().unwrap();
 
+        // §10.4 Layer 2: pull the platform's accessibility handler off
+        // before moving platform_window into Window. macOS provides
+        // one that feeds the accesskit_macos::Adapter; other platforms
+        // currently default to None.
+        let platform_accessibility_handler = platform_window.take_accessibility_handler();
+
         Ok(Window {
             handle,
             invalidator,
@@ -1648,6 +1661,7 @@ impl Window {
             inspector: None,
             pending_a11y_nodes: Vec::new(),
             accessibility_handler: None,
+            platform_accessibility_handler,
             a11y_tree_initialized: false,
         })
     }
@@ -1724,20 +1738,31 @@ impl Window {
     }
 
     /// Drain the per-frame accessibility buffer into a `TreeUpdate`
-    /// and call the registered handler. Called once per frame at
-    /// `draw()` finalization, after all elements have painted. No-op
-    /// if there's no handler or no pending nodes.
+    /// and dispatch to both the user-set observer handler and the
+    /// platform-installed handler (e.g. macOS AccessKit adapter).
+    /// Called once per frame at `draw()` finalization, after all
+    /// elements have painted. No-op if there are no pending nodes
+    /// or no handlers.
     fn drain_accessibility_tree(&mut self) {
         if self.pending_a11y_nodes.is_empty() {
             return;
         }
-        let nodes = std::mem::take(&mut self.pending_a11y_nodes);
-        let Some(handler) = self.accessibility_handler.as_mut() else {
+        if self.accessibility_handler.is_none() && self.platform_accessibility_handler.is_none() {
+            self.pending_a11y_nodes.clear();
             return;
-        };
+        }
+        let nodes = std::mem::take(&mut self.pending_a11y_nodes);
         let declare_tree = !self.a11y_tree_initialized;
         let update = crate::accessibility::build_tree_update(nodes, declare_tree);
-        handler(update);
+        // Both handlers receive the same update. TreeUpdate is Clone;
+        // the platform handler runs after the user handler so the
+        // user can observe before the platform does anything with it.
+        if let Some(handler) = self.accessibility_handler.as_mut() {
+            handler(update.clone());
+        }
+        if let Some(handler) = self.platform_accessibility_handler.as_mut() {
+            handler(update);
+        }
         self.a11y_tree_initialized = true;
     }
 
