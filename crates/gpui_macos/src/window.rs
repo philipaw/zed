@@ -678,17 +678,35 @@ impl MacWindowState {
 
 unsafe impl Send for MacWindowState {}
 
-/// §10.4 Layer 2: stub ActionHandler. AccessKit invokes this when an
-/// AT (VoiceOver, etc.) requests an action against a node — clicks,
-/// focus changes, etc. The no-op landed in this commit gets the
-/// adapter alive without yet routing actions back to gpui's input
-/// system. A subsequent commit will translate `ActionRequest`s into
-/// gpui events.
-struct NoopActionHandler;
+/// §10.4 Layer 2 sub-4: ActionRequest observer.
+///
+/// AccessKit invokes `do_action` when an AT (VoiceOver, Inspector,
+/// AT-SPI clients, etc.) wants to act on a node — `Action::Click`,
+/// `Action::Focus`, `Action::ScrollIntoView`, etc. Real production
+/// routing back into gpui's input system needs three pieces we don't
+/// have yet:
+///   (a) a NodeId → element-bounds map (for synthesizing mouse events
+///       on click actions);
+///   (b) a NodeId → FocusHandle map (for focus actions — currently we
+///       only have FocusHandle → NodeId, the inverse);
+///   (c) cross-thread dispatch: AccessKit calls do_action from
+///       AppKit's a11y subsystem at unpredictable times; gpui input
+///       events expect to be dispatched on the foreground runloop.
+///
+/// All three are deferred — for now we log the action so that, when
+/// rendering is fixed and an AT actually triggers something, we have
+/// observability into what arrived. A subsequent commit will land the
+/// real routing.
+struct LoggingActionHandler;
 
-impl accesskit::ActionHandler for NoopActionHandler {
-    fn do_action(&mut self, _request: accesskit::ActionRequest) {
-        // TODO(Layer 2 follow-up): route to gpui's input system.
+impl accesskit::ActionHandler for LoggingActionHandler {
+    fn do_action(&mut self, request: accesskit::ActionRequest) {
+        log::info!(
+            "[a11y] ActionRequest received: action={:?} target_node={:?} data={:?}",
+            request.action,
+            request.target_node,
+            request.data,
+        );
     }
 }
 
@@ -864,7 +882,7 @@ impl MacWindow {
                 WindowActivationHandler {
                     state: a11y_state.clone(),
                 },
-                NoopActionHandler,
+                LoggingActionHandler,
             );
 
             let mut window = Self(Arc::new(Mutex::new(MacWindowState {
