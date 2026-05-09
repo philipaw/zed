@@ -1032,11 +1032,14 @@ pub struct Window {
     /// below — both fire when both are set.
     accessibility_handler: Option<Box<dyn FnMut(accesskit::TreeUpdate) + Send + 'static>>,
     /// Platform-installed handler set during `Window::new` from
-    /// `PlatformWindow::take_accessibility_handler`. On macOS this
-    /// holds a closure that feeds `accesskit_macos::Adapter::update_if_active`;
-    /// other platforms get `None` until they implement the trait method.
-    platform_accessibility_handler:
-        Option<Box<dyn FnMut(accesskit::TreeUpdate) + Send + 'static>>,
+    /// `PlatformWindow::take_accessibility_handler`. Receives
+    /// `AccessibilityDrain` (tree update + focus inverse map). On
+    /// macOS this holds a closure that feeds the
+    /// `accesskit_macos::SubclassingAdapter` and stashes the inverse
+    /// map for the action handler. Other platforms get `None`.
+    platform_accessibility_handler: Option<
+        Box<dyn FnMut(crate::accessibility::AccessibilityDrain) + Send + 'static>,
+    >,
     /// Tracks whether the first `TreeUpdate` for this Window has been
     /// emitted yet. AccessKit requires the `tree` field be set on the
     /// initial update; subsequent updates may set it to `None`.
@@ -1051,6 +1054,12 @@ pub struct Window {
     /// returns a Some(node) from `accessibility()`. Drained at frame
     /// finish to look up `Window::focus`'s NodeId for `TreeUpdate::focus`.
     pending_a11y_focus_map: std::collections::HashMap<FocusId, accesskit::NodeId>,
+    /// Inverse of `pending_a11y_focus_map` — `NodeId → FocusId`.
+    /// Drained at frame finish into the platform handler's
+    /// `AccessibilityDrain` so action handlers can resolve
+    /// `Action::Focus` requests back to a gpui `FocusHandle`.
+    pending_a11y_focus_inverse_map:
+        std::collections::HashMap<accesskit::NodeId, FocusId>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1675,6 +1684,7 @@ impl Window {
             a11y_tree_initialized: false,
             last_a11y_nodes: std::collections::HashMap::new(),
             pending_a11y_focus_map: std::collections::HashMap::new(),
+            pending_a11y_focus_inverse_map: std::collections::HashMap::new(),
         })
     }
 
@@ -1760,6 +1770,7 @@ impl Window {
         node_id: accesskit::NodeId,
     ) {
         self.pending_a11y_focus_map.insert(focus_id, node_id);
+        self.pending_a11y_focus_inverse_map.insert(node_id, focus_id);
     }
 
     /// Drain the per-frame accessibility buffer into a `TreeUpdate`
@@ -1780,10 +1791,12 @@ impl Window {
         if self.accessibility_handler.is_none() && self.platform_accessibility_handler.is_none() {
             self.pending_a11y_nodes.clear();
             self.pending_a11y_focus_map.clear();
+            self.pending_a11y_focus_inverse_map.clear();
             return;
         }
         let collected = std::mem::take(&mut self.pending_a11y_nodes);
         let focus_map = std::mem::take(&mut self.pending_a11y_focus_map);
+        let focus_inverse_map = std::mem::take(&mut self.pending_a11y_focus_inverse_map);
         let current = crate::accessibility::full_tree(collected);
         let declare_tree = !self.a11y_tree_initialized;
         // Layer 1 (e): if the currently-focused FocusHandle has a
@@ -1797,14 +1810,17 @@ impl Window {
             declare_tree,
             focus_node_id,
         );
-        // Both handlers receive the same update. TreeUpdate is Clone;
-        // the platform handler runs after the user handler so the
-        // user can observe before the platform does anything with it.
+        // User-set observer handler stays on the simple TreeUpdate
+        // signature (backward-compat). Platform handler gets the
+        // richer AccessibilityDrain so it can resolve action requests.
         if let Some(handler) = self.accessibility_handler.as_mut() {
             handler(update.clone());
         }
         if let Some(handler) = self.platform_accessibility_handler.as_mut() {
-            handler(update);
+            handler(crate::accessibility::AccessibilityDrain {
+                tree_update: update,
+                focus_inverse_map,
+            });
         }
         self.last_a11y_nodes = current;
         self.a11y_tree_initialized = true;

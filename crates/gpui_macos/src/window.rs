@@ -678,47 +678,64 @@ impl MacWindowState {
 
 unsafe impl Send for MacWindowState {}
 
-/// §10.4 Layer 2 sub-4: ActionRequest observer.
+/// §10.4 Layer 2 sub-4: ActionRequest observer with focus resolution.
 ///
 /// AccessKit invokes `do_action` when an AT (VoiceOver, Inspector,
 /// AT-SPI clients, etc.) wants to act on a node — `Action::Click`,
 /// `Action::Focus`, `Action::ScrollIntoView`, etc. Real production
-/// routing back into gpui's input system needs three pieces we don't
-/// have yet:
-///   (a) a NodeId → element-bounds map (for synthesizing mouse events
-///       on click actions);
-///   (b) a NodeId → FocusHandle map (for focus actions — currently we
-///       only have FocusHandle → NodeId, the inverse);
-///   (c) cross-thread dispatch: AccessKit calls do_action from
-///       AppKit's a11y subsystem at unpredictable times; gpui input
-///       events expect to be dispatched on the foreground runloop.
+/// routing back into gpui's input system still needs:
+///   (a) a NodeId → element-bounds map (for synthesizing mouse
+///       events on click actions);
+///   (b) cross-thread dispatch: although accesskit_macos guarantees
+///       `do_action` runs on the main thread, gpui input events
+///       need a `&mut Window` + `&mut App` we don't have here —
+///       the action would be deferred to the next paint cycle.
 ///
-/// All three are deferred — for now we log the action so that, when
-/// rendering is fixed and an AT actually triggers something, we have
-/// observability into what arrived. A subsequent commit will land the
-/// real routing.
-struct LoggingActionHandler;
+/// (c) a NodeId → FocusHandle inverse map *was* missing in the
+///     previous commit; this commit adds it. We can now resolve
+///     `Action::Focus` requests to a gpui `FocusId` and log the
+///     resolution. Acting on it (calling `focus_handle.focus(...)`)
+///     still needs (b).
+struct LoggingActionHandler {
+    state: Arc<Mutex<A11yState>>,
+}
 
 impl accesskit::ActionHandler for LoggingActionHandler {
     fn do_action(&mut self, request: accesskit::ActionRequest) {
+        let state = self.state.lock();
+        let resolved = if matches!(request.action, accesskit::Action::Focus) {
+            state
+                .focus_inverse_map
+                .get(&request.target_node)
+                .map(|fid| format!("{fid:?}"))
+                .unwrap_or_else(|| "<no FocusHandle for that NodeId>".to_string())
+        } else {
+            "n/a (not a Focus action)".to_string()
+        };
         log::info!(
-            "[a11y] ActionRequest received: action={:?} target_node={:?} data={:?}",
+            "[a11y] ActionRequest: action={:?} target_node={:?} data={:?}  resolved_focus_handle={}",
             request.action,
             request.target_node,
             request.data,
+            resolved,
         );
     }
 }
 
 /// §10.4 Layer 2 shared state between the platform handler closure
-/// and the activation handler stored inside `SubclassingAdapter`. The
-/// closure writes the FIRST TreeUpdate here (which has `tree: Some`
-/// + a full nodes list — the only kind suitable for accesskit's
-/// initialization). The activation handler reads it when AT first
-/// activates the tree.
+/// (writer), the activation handler (reader of `initial_update`),
+/// and the action handler (reader of `focus_inverse_map`). All three
+/// hold an `Arc<Mutex<...>>` clone of the same instance.
 #[derive(Default)]
 struct A11yState {
+    /// FIRST TreeUpdate from gpui's drain — has `tree: Some` + full
+    /// nodes list. Required because subsequent emissions are diffs
+    /// that can't initialize accesskit_consumer.
     initial_update: Option<accesskit::TreeUpdate>,
+    /// Most-recent `NodeId → FocusId` inverse map from gpui's drain.
+    /// Replaced each frame. The action handler reads this to resolve
+    /// `Action::Focus` requests back to a gpui `FocusHandle`.
+    focus_inverse_map: std::collections::HashMap<accesskit::NodeId, gpui::FocusId>,
 }
 
 /// Activation handler owned by the `SubclassingAdapter`. Reads the
@@ -882,7 +899,9 @@ impl MacWindow {
                 WindowActivationHandler {
                     state: a11y_state.clone(),
                 },
-                LoggingActionHandler,
+                LoggingActionHandler {
+                    state: a11y_state.clone(),
+                },
             );
 
             let mut window = Self(Arc::new(Mutex::new(MacWindowState {
@@ -1369,30 +1388,39 @@ impl PlatformWindow for MacWindow {
 
     fn take_accessibility_handler(
         &mut self,
-    ) -> Option<Box<dyn FnMut(accesskit::TreeUpdate) + Send + 'static>> {
-        // §10.4 Layer 2: closure feeds the SubclassingAdapter.
+    ) -> Option<
+        Box<
+            dyn FnMut(gpui::accessibility::AccessibilityDrain) + Send + 'static,
+        >,
+    > {
+        // §10.4 Layer 2: closure feeds the SubclassingAdapter and
+        // stashes per-frame state for the activation + action
+        // handlers (which are owned by the adapter and can't be
+        // mutated externally).
         //
-        // Only the FIRST update is stashed in a11y_state. gpui's
-        // first emission has `tree: Some` plus a full nodes list —
-        // exactly what accesskit_consumer's Tree::new needs to
-        // initialize. Subsequent emissions are diffs (empty nodes,
-        // tree: None); using them as initializers panics validate_global
-        // ("Root ID is not in the node list"). Once initialized, the
-        // adapter applies subsequent diffs incrementally via
-        // update_if_active without re-consulting the activation
-        // handler.
+        // - `initial_update` only gets set on the FIRST drain. gpui's
+        //   first emission has `tree: Some` plus a full nodes list,
+        //   which is what accesskit_consumer's Tree::new needs.
+        //   Subsequent emissions are diffs that would panic init.
+        // - `focus_inverse_map` is replaced every frame so the action
+        //   handler always sees the latest mapping.
         let state = self.0.clone();
-        Some(Box::new(move |update: accesskit::TreeUpdate| {
+        Some(Box::new(move |drain: gpui::accessibility::AccessibilityDrain| {
+            let gpui::accessibility::AccessibilityDrain {
+                tree_update,
+                focus_inverse_map,
+            } = drain;
             let mut win = state.as_ref().lock();
             {
                 let mut a11y = win.a11y_state.lock();
                 if a11y.initial_update.is_none() {
-                    a11y.initial_update = Some(update.clone());
+                    a11y.initial_update = Some(tree_update.clone());
                 }
+                a11y.focus_inverse_map = focus_inverse_map;
             }
             // QueuedEvents discarded for now; AT-action processing is
             // a follow-up.
-            let _ = win.a11y_adapter.update_if_active(|| update);
+            let _ = win.a11y_adapter.update_if_active(|| tree_update);
         }))
     }
 

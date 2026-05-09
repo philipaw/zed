@@ -12,6 +12,22 @@
 use crate::GlobalElementId;
 use std::hash::{Hash, Hasher};
 
+/// Per-frame payload handed to platform a11y adapters via
+/// `PlatformWindow::take_accessibility_handler`. Carries the
+/// projected `TreeUpdate` plus a `NodeId → FocusId` inverse of the
+/// per-frame focus mapping, so action handlers can resolve
+/// `Action::Focus` requests back to gpui's own `FocusHandle`s.
+pub struct AccessibilityDrain {
+    /// The diffed tree update for this frame. See `diff_tree_update`.
+    pub tree_update: accesskit::TreeUpdate,
+    /// Mapping from each `accesskit::NodeId` that originated from an
+    /// element with `id() == ElementId::FocusHandle(_)` back to the
+    /// corresponding gpui `FocusId`. Only includes nodes pushed in
+    /// this frame.
+    pub focus_inverse_map:
+        std::collections::HashMap<accesskit::NodeId, crate::FocusId>,
+}
+
 /// The synthetic root NodeId under which the framework attaches every
 /// element-projected accessibility node. AccessKit requires a single
 /// root per tree, but gpui's element trees can have multiple top-level
