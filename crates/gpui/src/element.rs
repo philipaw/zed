@@ -531,6 +531,15 @@ impl<E: Element> Drawable<E> {
                     ) {
                         let node_id = crate::accessibility::node_id_from_global(global_id);
                         window.push_accessibility_node(node_id, node);
+                        // §10.4 Layer 1 (e) focus mapping. If this
+                        // element's own id is a FocusHandle, register
+                        // the FocusId→NodeId association so drain can
+                        // resolve `Window::focus` to a NodeId.
+                        if let Some(crate::ElementId::FocusHandle(focus_id)) =
+                            global_id.0.last().cloned()
+                        {
+                            window.push_accessibility_focus_mapping(focus_id, node_id);
+                        }
                     }
                 }
 

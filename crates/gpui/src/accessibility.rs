@@ -73,6 +73,7 @@ pub(crate) fn diff_tree_update(
     current: &std::collections::HashMap<accesskit::NodeId, accesskit::Node>,
     last: &std::collections::HashMap<accesskit::NodeId, accesskit::Node>,
     declare_tree: bool,
+    focus_node_id: Option<accesskit::NodeId>,
 ) -> accesskit::TreeUpdate {
     let nodes: Vec<(accesskit::NodeId, accesskit::Node)> = if declare_tree {
         current.iter().map(|(id, n)| (*id, n.clone())).collect()
@@ -84,16 +85,15 @@ pub(crate) fn diff_tree_update(
             .collect()
     };
 
-    // Focus mapping (Layer 1 (e)) is a follow-up. For now we pick the
-    // first collected child as the focus sentinel — accesskit_consumer
-    // panics in validate_global if focus points at a node that isn't
-    // in the live tree, and root-as-sentinel doesn't survive its
-    // graft-chain walk reliably across versions. Picking a real leaf
-    // sidesteps that until proper focus mapping lands.
-    let focus = current
-        .keys()
-        .find(|id| **id != A11Y_ROOT_ID)
-        .copied()
+    // Layer 1 (e) focus mapping. If gpui has a focused FocusHandle
+    // whose NodeId is in the current tree, use it. Otherwise fall
+    // back to the first non-root collected node — both
+    // accesskit_consumer's validate_global and its graft-chain walk
+    // require focus to point at a live node, and root-as-sentinel
+    // doesn't survive that walk reliably.
+    let focus = focus_node_id
+        .filter(|id| current.contains_key(id))
+        .or_else(|| current.keys().find(|id| **id != A11Y_ROOT_ID).copied())
         .unwrap_or(A11Y_ROOT_ID);
 
     accesskit::TreeUpdate {
@@ -153,7 +153,7 @@ mod tests {
         let collected = vec![(accesskit::NodeId::from(42u64), button)];
         let current = full_tree(collected);
 
-        let update = diff_tree_update(&current, &std::collections::HashMap::new(), true);
+        let update = diff_tree_update(&current, &std::collections::HashMap::new(), true, None);
         assert!(
             update.tree.is_some(),
             "first emission must declare tree (TreeUpdate::tree required by AccessKit on init)"
@@ -168,7 +168,7 @@ mod tests {
     #[test]
     fn subsequent_emission_skips_tree_field() {
         let current = full_tree(vec![]);
-        let update = diff_tree_update(&current, &current, false);
+        let update = diff_tree_update(&current, &current, false, None);
         assert!(update.tree.is_none());
     }
 
@@ -178,7 +178,7 @@ mod tests {
         button.set_label("Hi");
         let collected = vec![(accesskit::NodeId::from(42u64), button)];
         let current = full_tree(collected);
-        let update = diff_tree_update(&current, &current, false);
+        let update = diff_tree_update(&current, &current, false, None);
         assert!(
             update.nodes.is_empty(),
             "diff against an identical previous tree must be empty"
@@ -195,11 +195,41 @@ mod tests {
         let last = full_tree(vec![(id, button_v1)]);
         let current = full_tree(vec![(id, button_v2)]);
 
-        let update = diff_tree_update(&current, &last, false);
+        let update = diff_tree_update(&current, &last, false, None);
         // Root's children list is the same (just [42]) → root unchanged.
         // Only the button (id=42) differs by label.
         assert_eq!(update.nodes.len(), 1);
         assert_eq!(update.nodes[0].0, id);
         assert_eq!(update.nodes[0].1.label(), Some("Bye"));
+    }
+
+    #[test]
+    fn focus_uses_provided_node_id_when_present_in_tree() {
+        let id_a = accesskit::NodeId::from(42u64);
+        let id_b = accesskit::NodeId::from(43u64);
+        let current = full_tree(vec![
+            (id_a, accesskit::Node::new(accesskit::Role::Button)),
+            (id_b, accesskit::Node::new(accesskit::Role::Button)),
+        ]);
+        // Differential: passing different focus_node_ids must produce
+        // different focus outputs. A function that ignored
+        // focus_node_id (e.g., "always pick first non-root") would
+        // return the same focus for both calls and one of these
+        // asserts would fail.
+        let with_a = diff_tree_update(&current, &current, false, Some(id_a));
+        let with_b = diff_tree_update(&current, &current, false, Some(id_b));
+        assert_eq!(with_a.focus, id_a);
+        assert_eq!(with_b.focus, id_b);
+    }
+
+    #[test]
+    fn focus_falls_back_when_provided_node_not_in_tree() {
+        let id_a = accesskit::NodeId::from(42u64);
+        let stale = accesskit::NodeId::from(99u64);
+        let current = full_tree(vec![(id_a, accesskit::Node::new(accesskit::Role::Button))]);
+        let update = diff_tree_update(&current, &current, false, Some(stale));
+        // Stale focus_node_id isn't in the tree → fall back to first
+        // non-root node (id_a).
+        assert_eq!(update.focus, id_a);
     }
 }

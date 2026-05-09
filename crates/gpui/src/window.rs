@@ -1046,6 +1046,11 @@ pub struct Window {
     /// to compute a minimal `TreeUpdate` rather than re-emitting
     /// everything every dirty frame.
     last_a11y_nodes: std::collections::HashMap<accesskit::NodeId, accesskit::Node>,
+    /// Per-frame `FocusId → NodeId` mapping populated by the framework
+    /// call site when an element with `id() == ElementId::FocusHandle(_)`
+    /// returns a Some(node) from `accessibility()`. Drained at frame
+    /// finish to look up `Window::focus`'s NodeId for `TreeUpdate::focus`.
+    pending_a11y_focus_map: std::collections::HashMap<FocusId, accesskit::NodeId>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1669,6 +1674,7 @@ impl Window {
             platform_accessibility_handler,
             a11y_tree_initialized: false,
             last_a11y_nodes: std::collections::HashMap::new(),
+            pending_a11y_focus_map: std::collections::HashMap::new(),
         })
     }
 
@@ -1743,6 +1749,19 @@ impl Window {
         self.pending_a11y_nodes.push((id, node));
     }
 
+    /// Register a `FocusId → NodeId` association for the current frame.
+    /// Called by the framework when an element whose own `ElementId`
+    /// is `ElementId::FocusHandle(_)` returns a Some(node) from
+    /// `accessibility()`. Drain looks up `Window::focus` in this map
+    /// to set `TreeUpdate::focus`.
+    pub(crate) fn push_accessibility_focus_mapping(
+        &mut self,
+        focus_id: FocusId,
+        node_id: accesskit::NodeId,
+    ) {
+        self.pending_a11y_focus_map.insert(focus_id, node_id);
+    }
+
     /// Drain the per-frame accessibility buffer into a `TreeUpdate`
     /// and dispatch to both the user-set observer handler and the
     /// platform-installed handler (e.g. macOS AccessKit adapter).
@@ -1760,15 +1779,23 @@ impl Window {
         }
         if self.accessibility_handler.is_none() && self.platform_accessibility_handler.is_none() {
             self.pending_a11y_nodes.clear();
+            self.pending_a11y_focus_map.clear();
             return;
         }
         let collected = std::mem::take(&mut self.pending_a11y_nodes);
+        let focus_map = std::mem::take(&mut self.pending_a11y_focus_map);
         let current = crate::accessibility::full_tree(collected);
         let declare_tree = !self.a11y_tree_initialized;
+        // Layer 1 (e): if the currently-focused FocusHandle has a
+        // registered NodeId in this frame's mapping, point AccessKit's
+        // focus at it. Falls back to "first non-root node" inside
+        // diff_tree_update if absent or stale.
+        let focus_node_id = self.focus.and_then(|fid| focus_map.get(&fid).copied());
         let update = crate::accessibility::diff_tree_update(
             &current,
             &self.last_a11y_nodes,
             declare_tree,
+            focus_node_id,
         );
         // Both handlers receive the same update. TreeUpdate is Clone;
         // the platform handler runs after the user handler so the
