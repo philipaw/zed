@@ -1233,6 +1233,27 @@ fn if_window_not_closed(closed: Arc<AtomicBool>, f: impl FnOnce()) {
     }
 }
 
+impl MacWindow {
+    /// §10.4 Layer 2 sub-4 test/inspection hook. Drives the action
+    /// handler directly with a synthesized `accesskit::ActionRequest`,
+    /// bypassing the OS path. The result lands in `A11yState`'s
+    /// pending_actions queue and is consumed by the next gpui draw —
+    /// same as a real OS-triggered action — so this is end-to-end
+    /// for the in-process pipeline.
+    ///
+    /// Used by tests + diagnostic harnesses; gated to debug or
+    /// test-support builds so it doesn't surface in production.
+    #[cfg(any(debug_assertions, feature = "test-support"))]
+    pub fn debug_inject_a11y_action(&self, request: accesskit::ActionRequest) {
+        let win = self.0.lock();
+        let mut handler = LoggingActionHandler {
+            state: win.a11y_state.clone(),
+        };
+        drop(win);
+        accesskit::ActionHandler::do_action(&mut handler, request);
+    }
+}
+
 impl PlatformWindow for MacWindow {
     fn bounds(&self) -> Bounds<Pixels> {
         self.0.as_ref().lock().bounds()
@@ -3177,5 +3198,68 @@ extern "C" fn toggle_tab_bar(this: &Object, _sel: Sel, _id: id) {
             callback();
             window_state.lock().toggle_tab_bar_callback = Some(callback);
         }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// §10.4 Layer 2 sub-4: verify that an Action::Focus arriving via
+    /// the action handler resolves through the focus inverse map and
+    /// enqueues a PendingA11yAction::Focus on A11yState. We do not
+    /// need a full MacWindowState — the action handler only ever
+    /// touches A11yState (lock-ordering invariant).
+    #[test]
+    fn focus_action_request_enqueues_pending_focus() {
+        let target_node = accesskit::NodeId::from(42u64);
+        // FocusId is a slotmap key; Default gives the null sentinel,
+        // sufficient as a hash-equal fingerprint here since we never
+        // resolve it back to a real FocusHandle in the test.
+        let focus_id = gpui::FocusId::default();
+        let mut state = A11yState::default();
+        state.focus_inverse_map.insert(target_node, focus_id);
+        let mut handler = LoggingActionHandler {
+            state: Arc::new(Mutex::new(state)),
+        };
+
+        accesskit::ActionHandler::do_action(
+            &mut handler,
+            accesskit::ActionRequest {
+                action: accesskit::Action::Focus,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node,
+                data: None,
+            },
+        );
+
+        let drained = std::mem::take(&mut handler.state.lock().pending_actions);
+        assert_eq!(drained.len(), 1, "Action::Focus must enqueue exactly one PendingA11yAction");
+        match drained[0] {
+            gpui::accessibility::PendingA11yAction::Focus(fid) => {
+                assert_eq!(fid, focus_id, "enqueued Focus must carry the resolved FocusId");
+            }
+        }
+    }
+
+    /// Action::Focus on a NodeId with no inverse-map entry should
+    /// log "no FocusHandle" and NOT enqueue anything.
+    #[test]
+    fn focus_action_request_with_unknown_node_does_not_enqueue() {
+        let mut handler = LoggingActionHandler {
+            state: Arc::new(Mutex::new(A11yState::default())),
+        };
+        accesskit::ActionHandler::do_action(
+            &mut handler,
+            accesskit::ActionRequest {
+                action: accesskit::Action::Focus,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: accesskit::NodeId::from(99u64),
+                data: None,
+            },
+        );
+        let drained = handler.state.lock().pending_actions.clone();
+        assert!(drained.is_empty(), "Focus on unknown NodeId must not enqueue");
     }
 }
