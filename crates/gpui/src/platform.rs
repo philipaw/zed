@@ -629,6 +629,16 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     > {
         None
     }
+    /// §10.4 Layer 2 sub-4: gpui core polls this at the start of each
+    /// `Window::draw` to apply platform-resolved a11y actions
+    /// (e.g. focus changes). Default returns empty. macOS returns
+    /// any `PendingA11yAction`s the AccessKit `ActionHandler`
+    /// enqueued since the last poll.
+    fn take_pending_a11y_actions(
+        &mut self,
+    ) -> Vec<crate::accessibility::PendingA11yAction> {
+        Vec::new()
+    }
     fn prompt(
         &self,
         level: PromptLevel,

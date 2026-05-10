@@ -2646,6 +2646,20 @@ impl Window {
         if let Some(input_handler) = self.platform_window.take_input_handler() {
             self.rendered_frame.input_handlers.push(Some(input_handler));
         }
+
+        // §10.4 Layer 2 sub-4: apply any platform-resolved a11y
+        // actions enqueued since the last draw. Done before draw_roots
+        // so focus changes are visible in this frame's rendered_frame.
+        for action in self.platform_window.take_pending_a11y_actions() {
+            match action {
+                crate::accessibility::PendingA11yAction::Focus(focus_id) => {
+                    if let Some(handle) = FocusHandle::for_id(focus_id, &cx.focus_handles) {
+                        self.focus(&handle, cx);
+                    }
+                }
+            }
+        }
+
         if !cx.mode.skip_drawing() {
             self.draw_roots(cx);
         }

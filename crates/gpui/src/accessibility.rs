@@ -12,6 +12,20 @@
 use crate::GlobalElementId;
 use std::hash::{Hash, Hasher};
 
+/// A platform-resolved action to apply to gpui state at the start of
+/// the next draw. Platform a11y adapters (e.g. `accesskit_macos`)
+/// receive `accesskit::ActionRequest`s asynchronously from the OS;
+/// they translate `target_node` (a `NodeId`) into a gpui domain key
+/// (`FocusId`, eventually element bounds for clicks) using the
+/// inverse maps in `AccessibilityDrain`, then enqueue a
+/// `PendingA11yAction` for gpui core to process when it has a
+/// `&mut Window + &mut App`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingA11yAction {
+    /// Focus the gpui `FocusHandle` identified by this `FocusId`.
+    Focus(crate::FocusId),
+}
+
 /// Per-frame payload handed to platform a11y adapters via
 /// `PlatformWindow::take_accessibility_handler`. Carries the
 /// projected `TreeUpdate` plus a `NodeId → FocusId` inverse of the

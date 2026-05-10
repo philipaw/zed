@@ -702,22 +702,27 @@ struct LoggingActionHandler {
 
 impl accesskit::ActionHandler for LoggingActionHandler {
     fn do_action(&mut self, request: accesskit::ActionRequest) {
-        let state = self.state.lock();
-        let resolved = if matches!(request.action, accesskit::Action::Focus) {
-            state
-                .focus_inverse_map
-                .get(&request.target_node)
-                .map(|fid| format!("{fid:?}"))
-                .unwrap_or_else(|| "<no FocusHandle for that NodeId>".to_string())
-        } else {
-            "n/a (not a Focus action)".to_string()
-        };
+        let mut state = self.state.lock();
+        let mut resolved = "n/a (not a Focus action)".to_string();
+        let mut enqueued = false;
+        if matches!(request.action, accesskit::Action::Focus) {
+            if let Some(focus_id) = state.focus_inverse_map.get(&request.target_node).copied() {
+                resolved = format!("{focus_id:?}");
+                state
+                    .pending_actions
+                    .push(gpui::accessibility::PendingA11yAction::Focus(focus_id));
+                enqueued = true;
+            } else {
+                resolved = "<no FocusHandle for that NodeId>".to_string();
+            }
+        }
         log::info!(
-            "[a11y] ActionRequest: action={:?} target_node={:?} data={:?}  resolved_focus_handle={}",
+            "[a11y] ActionRequest: action={:?} target_node={:?} data={:?}  resolved_focus_handle={}  enqueued={}",
             request.action,
             request.target_node,
             request.data,
             resolved,
+            enqueued,
         );
     }
 }
@@ -736,6 +741,13 @@ struct A11yState {
     /// Replaced each frame. The action handler reads this to resolve
     /// `Action::Focus` requests back to a gpui `FocusHandle`.
     focus_inverse_map: std::collections::HashMap<accesskit::NodeId, gpui::FocusId>,
+    /// §10.4 Layer 2 sub-4 dispatch queue. The action handler pushes
+    /// here when an AT triggers an actionable request whose target
+    /// resolves to a gpui domain key (e.g. FocusId for Action::Focus).
+    /// `MacWindow::take_pending_a11y_actions` drains this on each
+    /// gpui draw, where `&mut Window + &mut App` are available to
+    /// actually apply the action.
+    pending_actions: Vec<gpui::accessibility::PendingA11yAction>,
 }
 
 /// Activation handler owned by the `SubclassingAdapter`. Reads the
@@ -1422,6 +1434,18 @@ impl PlatformWindow for MacWindow {
             // a follow-up.
             let _ = win.a11y_adapter.update_if_active(|| tree_update);
         }))
+    }
+
+    fn take_pending_a11y_actions(
+        &mut self,
+    ) -> Vec<gpui::accessibility::PendingA11yAction> {
+        // Drain whatever the LoggingActionHandler enqueued since the
+        // last gpui draw. The action handler runs on the AppKit main
+        // thread but without &mut Window/App; this hook hands the
+        // pending list back to gpui core where those are available.
+        let win = self.0.lock();
+        let mut state = win.a11y_state.lock();
+        std::mem::take(&mut state.pending_actions)
     }
 
     fn prompt(
