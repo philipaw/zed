@@ -190,6 +190,27 @@ impl Application {
         }));
     }
 
+    /// Same as [`Self::run`] but takes `&mut self` so the caller retains
+    /// ownership of the `Application` past the run loop. Necessary on
+    /// platforms whose `Platform::run` returns synchronously (iOS) but
+    /// whose application state must outlive the run callback — without
+    /// this, dropping `Application` cascades to drop every Window the
+    /// callback opened, which on iOS leaves the UIKit tree pointing at
+    /// freed memory.
+    ///
+    /// The body is identical to `run`; only the signature differs.
+    pub fn run_until<F>(&mut self, on_finish_launching: F)
+    where
+        F: 'static + FnOnce(&mut App),
+    {
+        let this = self.0.clone();
+        let platform = self.0.borrow().platform.clone();
+        platform.run(Box::new(move || {
+            let cx = &mut *this.borrow_mut();
+            on_finish_launching(cx);
+        }));
+    }
+
     /// Register a handler to be invoked when the platform instructs the application
     /// to open one or more URLs.
     pub fn on_open_urls<F>(&self, mut callback: F) -> &Self
