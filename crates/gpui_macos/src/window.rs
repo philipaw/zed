@@ -592,10 +592,8 @@ impl MacWindowState {
                 return;
             }
         }
-        let display_id = unsafe { display_id_for_screen(self.native_window.screen()) };
-        if let Some(mut display_link) =
-            DisplayLink::new(display_id, self.native_view.as_ptr() as *mut c_void, step).log_err()
-        {
+        let view_ptr = self.native_view.as_ptr() as *mut c_void;
+        if let Some(mut display_link) = DisplayLink::new(view_ptr, view_ptr, step).log_err() {
             display_link.start().log_err();
             self.display_link = Some(display_link);
         }
