@@ -17,6 +17,16 @@ use objc::{
 use std::ffi::c_void;
 use std::ptr;
 
+#[link(name = "Foundation", kind = "framework")]
+unsafe extern "C" {
+    /// `NSRunLoopCommonModes` — pseudo-mode that's the union of
+    /// NSDefaultRunLoopMode and any modes added via
+    /// `CFRunLoopAddCommonMode`. Includes NSEventTrackingRunLoopMode
+    /// (mouse drags) and NSModalPanelRunLoopMode, so display-link
+    /// callbacks keep firing during user interaction.
+    static NSRunLoopCommonModes: id;
+}
+
 const TARGET_DATA_IVAR: &str = "displayLinkData";
 const TARGET_CALLBACK_IVAR: &str = "displayLinkCallback";
 
@@ -55,9 +65,16 @@ pub struct DisplayLink {
 }
 
 impl DisplayLink {
-    /// `view` must be a non-null NSView pointer (macOS 14+ provides
-    /// `-[NSView displayLinkWithTarget:selector:]`, which schedules the
-    /// link on `NSRunLoopCommonModes` of the main run loop automatically).
+    /// `view` must be a non-null NSView pointer. macOS 14+ provides
+    /// `-[NSView displayLinkWithTarget:selector:]`, which returns a
+    /// CADisplayLink configured for the view's screen but **does not
+    /// schedule it on any run loop** — the caller must invoke
+    /// `addToRunLoop:forMode:` for the link's callback to fire.
+    /// (The earlier version of this comment claimed the API
+    /// auto-schedules; that was wrong. Without scheduling, the link
+    /// never fires and redraws happen only through lifecycle direct-
+    /// invocations like `windowDidBecomeKey` → `request_frame_callback`.
+    /// See DESIGN.md §17.8.)
     pub fn new(
         view: *mut c_void,
         data: *mut c_void,
@@ -82,6 +99,14 @@ impl DisplayLink {
                 anyhow::bail!("NSView returned null display link (requires macOS 14+)");
             }
             let link: id = msg_send![link, retain];
+
+            // Schedule on the main run loop in NSRunLoopCommonModes so
+            // the link's callback fires every vsync while the view is
+            // attached to a visible window — including during event
+            // tracking (mouse drags, modal panels). Without this, the
+            // link is inert.
+            let main_run_loop: id = msg_send![class!(NSRunLoop), mainRunLoop];
+            let _: () = msg_send![link, addToRunLoop: main_run_loop forMode: NSRunLoopCommonModes];
 
             // Paused until start() — matches CVDisplayLink semantics.
             let _: () = msg_send![link, setPaused: YES];
