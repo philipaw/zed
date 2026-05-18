@@ -298,8 +298,20 @@ impl WgpuRenderer {
                     })
             };
 
+        // Preference order matters: iOS sim's wgpu Metal surface only
+        // advertises `[Opaque, PostMultiplied]` — no `PreMultiplied`
+        // and no `Inherit` — so the original two-mode list silently
+        // fell back to `Opaque` and the CAMetalLayer was composited
+        // as fully opaque regardless of the `transparent: true` flag.
+        // `PostMultiplied` works because gpui's internal pipelines use
+        // `wgpu::BlendState::ALPHA_BLENDING` (standard, non-
+        // premultiplied) when the alpha mode is anything other than
+        // `PreMultiplied` — the shader output's RGB is already in the
+        // shape `PostMultiplied` expects. Surfaced 2026-05-18 during
+        // gem's step-1.5 platform_view composition work.
         let transparent_alpha_mode = pick_alpha_mode(&[
             wgpu::CompositeAlphaMode::PreMultiplied,
+            wgpu::CompositeAlphaMode::PostMultiplied,
             wgpu::CompositeAlphaMode::Inherit,
         ])?;
 
