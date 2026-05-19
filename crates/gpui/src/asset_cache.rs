@@ -72,7 +72,12 @@ where
         cx: &mut App,
     ) -> impl Future<Output = Self::Output> + Send + 'static {
         let load = T::load(source, cx);
-        load.inspect_err(|e| log::error!("Failed to load asset: {}", e))
+        // `{:#}` prints the full anyhow chain (Display-with-cause).
+        // Without it the message stops at the outermost
+        // `with_context("loading image asset from …")` wrapper and
+        // hides the underlying failure (TLS handshake, DNS, status
+        // code, etc.) that the caller needs to diagnose.
+        load.inspect_err(|e| log::error!("Failed to load asset: {:#}", e))
     }
 }
 
