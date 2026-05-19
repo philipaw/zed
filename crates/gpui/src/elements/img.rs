@@ -752,7 +752,12 @@ impl Asset for ImageAssetLoader {
 #[derive(Debug, Error, Clone)]
 pub enum ImageCacheError {
     /// Some other kind of error occurred
-    #[error("error: {0}")]
+    /// `{0:#}` invokes `anyhow::Error`'s alt-Display, which prints
+    /// the full Context chain on one line (`outer: middle: inner`).
+    /// Without `:#` only the outermost message prints, which
+    /// hides underlying causes (TLS handshake, DNS, decode error,
+    /// HTTP body, etc.) — the most actionable diagnostic info.
+    #[error("error: {0:#}")]
     Other(#[from] Arc<anyhow::Error>),
     /// An error that occurred while reading the image from disk.
     #[error("IO error: {0}")]
