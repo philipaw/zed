@@ -1,71 +1,131 @@
+//! Per-window display synchronisation via CADisplayLink (macOS 14+).
+//!
+//! Replaced the legacy CVDisplayLink-based implementation in mid-2026:
+//! starting on macOS 26, CVDisplayLink fires once or twice and then ceases,
+//! leaving windows frozen on their last rendered frame. CADisplayLink
+//! attached to the owning NSView is the supported replacement.
 use anyhow::Result;
-use core_graphics::display::CGDirectDisplayID;
-use dispatch2::{
-    _dispatch_source_type_data_add, DispatchObject, DispatchQueue, DispatchRetained, DispatchSource,
+use cocoa::base::{id, nil};
+use ctor::ctor;
+use objc::{
+    class,
+    declare::ClassDecl,
+    msg_send,
+    runtime::{Class, Object, Sel, NO, YES},
+    sel, sel_impl,
 };
 use std::ffi::c_void;
-use util::ResultExt;
+use std::ptr;
+
+#[link(name = "Foundation", kind = "framework")]
+unsafe extern "C" {
+    /// `NSRunLoopCommonModes` — pseudo-mode that's the union of
+    /// NSDefaultRunLoopMode and any modes added via
+    /// `CFRunLoopAddCommonMode`. Includes NSEventTrackingRunLoopMode
+    /// (mouse drags) and NSModalPanelRunLoopMode, so display-link
+    /// callbacks keep firing during user interaction.
+    static NSRunLoopCommonModes: id;
+}
+
+const TARGET_DATA_IVAR: &str = "displayLinkData";
+const TARGET_CALLBACK_IVAR: &str = "displayLinkCallback";
+
+static mut DISPLAY_LINK_TARGET_CLASS: *const Class = ptr::null();
+
+#[ctor]
+unsafe fn build_display_link_target_class() {
+    unsafe {
+        let mut decl =
+            ClassDecl::new("GPUIDisplayLinkTarget", class!(NSObject)).unwrap();
+        decl.add_ivar::<*mut c_void>(TARGET_DATA_IVAR);
+        decl.add_ivar::<*mut c_void>(TARGET_CALLBACK_IVAR);
+        decl.add_method(
+            sel!(displayLinkFired:),
+            display_link_fired as extern "C" fn(&Object, Sel, id),
+        );
+        DISPLAY_LINK_TARGET_CLASS = decl.register();
+    }
+}
+
+extern "C" fn display_link_fired(this: &Object, _: Sel, _link: id) {
+    unsafe {
+        let data: *mut c_void = *this.get_ivar(TARGET_DATA_IVAR);
+        let callback_raw: *mut c_void = *this.get_ivar(TARGET_CALLBACK_IVAR);
+        if callback_raw.is_null() {
+            return;
+        }
+        let callback: extern "C" fn(*mut c_void) = std::mem::transmute(callback_raw);
+        callback(data);
+    }
+}
 
 pub struct DisplayLink {
-    display_link: Option<sys::DisplayLink>,
-    frame_requests: DispatchRetained<DispatchSource>,
+    link: id,   // CADisplayLink, retained
+    target: id, // GPUIDisplayLinkTarget, retained
 }
 
 impl DisplayLink {
+    /// `view` must be a non-null NSView pointer. macOS 14+ provides
+    /// `-[NSView displayLinkWithTarget:selector:]`, which returns a
+    /// CADisplayLink configured for the view's screen but **does not
+    /// schedule it on any run loop** — the caller must invoke
+    /// `addToRunLoop:forMode:` for the link's callback to fire.
+    /// (The earlier version of this comment claimed the API
+    /// auto-schedules; that was wrong. Without scheduling, the link
+    /// never fires and redraws happen only through lifecycle direct-
+    /// invocations like `windowDidBecomeKey` → `request_frame_callback`.
+    /// See DESIGN.md §17.8.)
     pub fn new(
-        display_id: CGDirectDisplayID,
+        view: *mut c_void,
         data: *mut c_void,
         callback: extern "C" fn(*mut c_void),
     ) -> Result<DisplayLink> {
-        unsafe extern "C" fn display_link_callback(
-            _display_link_out: *mut sys::CVDisplayLink,
-            _current_time: *const sys::CVTimeStamp,
-            _output_time: *const sys::CVTimeStamp,
-            _flags_in: i64,
-            _flags_out: *mut i64,
-            frame_requests: *mut c_void,
-        ) -> i32 {
-            unsafe {
-                let frame_requests = &*(frame_requests as *const DispatchSource);
-                frame_requests.merge_data(1);
-                0
-            }
-        }
-
+        anyhow::ensure!(!view.is_null(), "view pointer is null");
         unsafe {
-            let frame_requests = DispatchSource::new(
-                &raw const _dispatch_source_type_data_add as *mut _,
-                0,
-                0,
-                Some(DispatchQueue::main()),
-            );
-            frame_requests.set_context(data);
-            frame_requests.set_event_handler_f(callback);
-            frame_requests.resume();
+            let target: id = msg_send![DISPLAY_LINK_TARGET_CLASS, alloc];
+            let target: id = msg_send![target, init];
+            anyhow::ensure!(!target.is_null(), "could not allocate display-link target");
+            (*target).set_ivar(TARGET_DATA_IVAR, data);
+            (*target).set_ivar(TARGET_CALLBACK_IVAR, callback as *mut c_void);
 
-            let display_link = sys::DisplayLink::new(
-                display_id,
-                display_link_callback,
-                &*frame_requests as *const DispatchSource as *mut c_void,
-            )?;
+            let view = view as id;
+            let link: id = msg_send![
+                view,
+                displayLinkWithTarget: target
+                selector: sel!(displayLinkFired:)
+            ];
+            if link.is_null() {
+                let _: () = msg_send![target, release];
+                anyhow::bail!("NSView returned null display link (requires macOS 14+)");
+            }
+            let link: id = msg_send![link, retain];
 
-            Ok(Self {
-                display_link: Some(display_link),
-                frame_requests,
-            })
+            // Schedule on the main run loop in NSRunLoopCommonModes so
+            // the link's callback fires every vsync while the view is
+            // attached to a visible window — including during event
+            // tracking (mouse drags, modal panels). Without this, the
+            // link is inert.
+            let main_run_loop: id = msg_send![class!(NSRunLoop), mainRunLoop];
+            let _: () = msg_send![link, addToRunLoop: main_run_loop forMode: NSRunLoopCommonModes];
+
+            // Paused until start() — matches CVDisplayLink semantics.
+            let _: () = msg_send![link, setPaused: YES];
+
+            Ok(DisplayLink { link, target })
         }
     }
 
     pub fn start(&mut self) -> Result<()> {
         unsafe {
-            self.display_link.as_mut().unwrap().start()?;
+            let _: () = msg_send![self.link, setPaused: NO];
         }
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn stop(&mut self) -> Result<()> {
         unsafe {
-            self.display_link.as_mut().unwrap().stop()?;
+            let _: () = msg_send![self.link, setPaused: YES];
         }
         Ok(())
     }
@@ -73,193 +133,13 @@ impl DisplayLink {
 
 impl Drop for DisplayLink {
     fn drop(&mut self) {
-        self.stop().log_err();
-        // We see occasional segfaults on the CVDisplayLink thread.
-        //
-        // It seems possible that this happens because CVDisplayLinkRelease releases the CVDisplayLink
-        // on the main thread immediately, but the background thread that CVDisplayLink uses for timers
-        // is still accessing it.
-        //
-        // We might also want to upgrade to CADisplayLink, but that requires dropping old macOS support.
-        std::mem::forget(self.display_link.take());
-        self.frame_requests.cancel();
-    }
-}
-
-mod sys {
-    //! Derived from display-link crate under the following license:
-    //! <https://github.com/BrainiumLLC/display-link/blob/master/LICENSE-MIT>
-    //! Apple docs: [CVDisplayLink](https://developer.apple.com/documentation/corevideo/cvdisplaylinkoutputcallback?language=objc)
-    #![allow(dead_code, non_upper_case_globals)]
-
-    use anyhow::Result;
-    use core_graphics::display::CGDirectDisplayID;
-    use foreign_types::{ForeignType, foreign_type};
-    use std::{
-        ffi::c_void,
-        fmt::{self, Debug, Formatter},
-    };
-
-    #[derive(Debug)]
-    pub enum CVDisplayLink {}
-
-    foreign_type! {
-        pub unsafe type DisplayLink {
-            type CType = CVDisplayLink;
-            fn drop = CVDisplayLinkRelease;
-            fn clone = CVDisplayLinkRetain;
-        }
-    }
-
-    impl Debug for DisplayLink {
-        fn fmt(&self, formatter: &mut Formatter) -> fmt::Result {
-            formatter
-                .debug_tuple("DisplayLink")
-                .field(&self.as_ptr())
-                .finish()
-        }
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub(crate) struct CVTimeStamp {
-        pub version: u32,
-        pub video_time_scale: i32,
-        pub video_time: i64,
-        pub host_time: u64,
-        pub rate_scalar: f64,
-        pub video_refresh_period: i64,
-        pub smpte_time: CVSMPTETime,
-        pub flags: u64,
-        pub reserved: u64,
-    }
-
-    pub type CVTimeStampFlags = u64;
-
-    pub const kCVTimeStampVideoTimeValid: CVTimeStampFlags = 1 << 0;
-    pub const kCVTimeStampHostTimeValid: CVTimeStampFlags = 1 << 1;
-    pub const kCVTimeStampSMPTETimeValid: CVTimeStampFlags = 1 << 2;
-    pub const kCVTimeStampVideoRefreshPeriodValid: CVTimeStampFlags = 1 << 3;
-    pub const kCVTimeStampRateScalarValid: CVTimeStampFlags = 1 << 4;
-    pub const kCVTimeStampTopField: CVTimeStampFlags = 1 << 16;
-    pub const kCVTimeStampBottomField: CVTimeStampFlags = 1 << 17;
-    pub const kCVTimeStampVideoHostTimeValid: CVTimeStampFlags =
-        kCVTimeStampVideoTimeValid | kCVTimeStampHostTimeValid;
-    pub const kCVTimeStampIsInterlaced: CVTimeStampFlags =
-        kCVTimeStampTopField | kCVTimeStampBottomField;
-
-    #[repr(C)]
-    #[derive(Clone, Copy, Default)]
-    pub(crate) struct CVSMPTETime {
-        pub subframes: i16,
-        pub subframe_divisor: i16,
-        pub counter: u32,
-        pub time_type: u32,
-        pub flags: u32,
-        pub hours: i16,
-        pub minutes: i16,
-        pub seconds: i16,
-        pub frames: i16,
-    }
-
-    pub type CVSMPTETimeType = u32;
-
-    pub const kCVSMPTETimeType24: CVSMPTETimeType = 0;
-    pub const kCVSMPTETimeType25: CVSMPTETimeType = 1;
-    pub const kCVSMPTETimeType30Drop: CVSMPTETimeType = 2;
-    pub const kCVSMPTETimeType30: CVSMPTETimeType = 3;
-    pub const kCVSMPTETimeType2997: CVSMPTETimeType = 4;
-    pub const kCVSMPTETimeType2997Drop: CVSMPTETimeType = 5;
-    pub const kCVSMPTETimeType60: CVSMPTETimeType = 6;
-    pub const kCVSMPTETimeType5994: CVSMPTETimeType = 7;
-
-    pub type CVSMPTETimeFlags = u32;
-
-    pub const kCVSMPTETimeValid: CVSMPTETimeFlags = 1 << 0;
-    pub const kCVSMPTETimeRunning: CVSMPTETimeFlags = 1 << 1;
-
-    pub type CVDisplayLinkOutputCallback = unsafe extern "C" fn(
-        display_link_out: *mut CVDisplayLink,
-        // A pointer to the current timestamp. This represents the timestamp when the callback is called.
-        current_time: *const CVTimeStamp,
-        // A pointer to the output timestamp. This represents the timestamp for when the frame will be displayed.
-        output_time: *const CVTimeStamp,
-        // Unused
-        flags_in: i64,
-        // Unused
-        flags_out: *mut i64,
-        // A pointer to app-defined data.
-        display_link_context: *mut c_void,
-    ) -> i32;
-
-    #[link(name = "CoreFoundation", kind = "framework")]
-    #[link(name = "CoreVideo", kind = "framework")]
-    #[allow(improper_ctypes, unknown_lints, clippy::duplicated_attributes)]
-    unsafe extern "C" {
-        pub fn CVDisplayLinkCreateWithActiveCGDisplays(
-            display_link_out: *mut *mut CVDisplayLink,
-        ) -> i32;
-        pub fn CVDisplayLinkSetCurrentCGDisplay(
-            display_link: &mut DisplayLinkRef,
-            display_id: u32,
-        ) -> i32;
-        pub fn CVDisplayLinkSetOutputCallback(
-            display_link: &mut DisplayLinkRef,
-            callback: CVDisplayLinkOutputCallback,
-            user_info: *mut c_void,
-        ) -> i32;
-        pub fn CVDisplayLinkStart(display_link: &mut DisplayLinkRef) -> i32;
-        pub fn CVDisplayLinkStop(display_link: &mut DisplayLinkRef) -> i32;
-        pub fn CVDisplayLinkRelease(display_link: *mut CVDisplayLink);
-        pub fn CVDisplayLinkRetain(display_link: *mut CVDisplayLink) -> *mut CVDisplayLink;
-    }
-
-    impl DisplayLink {
-        /// Apple docs: [CVDisplayLinkCreateWithCGDisplay](https://developer.apple.com/documentation/corevideo/1456981-cvdisplaylinkcreatewithcgdisplay?language=objc)
-        pub unsafe fn new(
-            display_id: CGDirectDisplayID,
-            callback: CVDisplayLinkOutputCallback,
-            user_info: *mut c_void,
-        ) -> Result<Self> {
-            unsafe {
-                let mut display_link: *mut CVDisplayLink = 0 as _;
-
-                let code = CVDisplayLinkCreateWithActiveCGDisplays(&mut display_link);
-                anyhow::ensure!(code == 0, "could not create display link, code: {}", code);
-
-                let mut display_link = DisplayLink::from_ptr(display_link);
-
-                let code = CVDisplayLinkSetOutputCallback(&mut display_link, callback, user_info);
-                anyhow::ensure!(code == 0, "could not set output callback, code: {}", code);
-
-                let code = CVDisplayLinkSetCurrentCGDisplay(&mut display_link, display_id);
-                anyhow::ensure!(
-                    code == 0,
-                    "could not assign display to display link, code: {}",
-                    code
-                );
-
-                Ok(display_link)
+        unsafe {
+            if self.link != nil {
+                let _: () = msg_send![self.link, invalidate];
+                let _: () = msg_send![self.link, release];
             }
-        }
-    }
-
-    impl DisplayLinkRef {
-        /// Apple docs: [CVDisplayLinkStart](https://developer.apple.com/documentation/corevideo/1457193-cvdisplaylinkstart?language=objc)
-        pub unsafe fn start(&mut self) -> Result<()> {
-            unsafe {
-                let code = CVDisplayLinkStart(self);
-                anyhow::ensure!(code == 0, "could not start display link, code: {}", code);
-                Ok(())
-            }
-        }
-
-        /// Apple docs: [CVDisplayLinkStop](https://developer.apple.com/documentation/corevideo/1457281-cvdisplaylinkstop?language=objc)
-        pub unsafe fn stop(&mut self) -> Result<()> {
-            unsafe {
-                let code = CVDisplayLinkStop(self);
-                anyhow::ensure!(code == 0, "could not stop display link, code: {}", code);
-                Ok(())
+            if self.target != nil {
+                let _: () = msg_send![self.target, release];
             }
         }
     }

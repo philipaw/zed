@@ -1797,7 +1797,24 @@ impl Window {
         let collected = std::mem::take(&mut self.pending_a11y_nodes);
         let focus_map = std::mem::take(&mut self.pending_a11y_focus_map);
         let focus_inverse_map = std::mem::take(&mut self.pending_a11y_focus_inverse_map);
-        let current = crate::accessibility::full_tree(collected);
+        let mut current = crate::accessibility::full_tree(collected);
+        // §10.4 Layer 1: stamp viewport bounds on the synthetic root
+        // so NSAccessibility hit-test from Inspector / VoiceOver
+        // descends into the tree. AccessKit Rect is in physical
+        // (DPI-dependent) pixels per accesskit_macos's `to_ns_rect`
+        // which divides by scale_factor before converting to screen
+        // coords. Without these the root has `bounds=None` and AT
+        // sees a tree with no spatial extent.
+        if let Some(root) = current.get_mut(&crate::accessibility::A11Y_ROOT_ID) {
+            let factor = f64::from(self.scale_factor);
+            let viewport_size = self.viewport_size;
+            root.set_bounds(accesskit::Rect::new(
+                0.0,
+                0.0,
+                f64::from(viewport_size.width.0) * factor,
+                f64::from(viewport_size.height.0) * factor,
+            ));
+        }
         let declare_tree = !self.a11y_tree_initialized;
         // Layer 1 (e): if the currently-focused FocusHandle has a
         // registered NodeId in this frame's mapping, point AccessKit's
