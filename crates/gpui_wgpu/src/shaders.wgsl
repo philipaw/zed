@@ -1334,3 +1334,29 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
 
     return ycbcr_to_RGB * y_cb_cr;
 }
+
+// --- blit --- //
+// G1 (gem glass): fullscreen 1:1 copy of the offscreen scene texture
+// (T0) to the drawable. Uses `textureLoad` at the framebuffer pixel
+// coordinate so no sampler/filtering is involved — the copy is
+// texel-exact by construction.
+
+@group(0) @binding(0) var t_blit_source: texture_2d<f32>;
+
+struct BlitVarying {
+    @builtin(position) position: vec4<f32>,
+}
+
+@vertex
+fn vs_blit(@builtin(vertex_index) vertex_id: u32) -> BlitVarying {
+    // Fullscreen triangle: (-1,-1), (3,-1), (-1,3) in clip space.
+    let corner = vec2<f32>(f32((vertex_id << 1u) & 2u), f32(vertex_id & 2u));
+    var out = BlitVarying();
+    out.position = vec4<f32>(corner * 2.0 - 1.0, 0.0, 1.0);
+    return out;
+}
+
+@fragment
+fn fs_blit(input: BlitVarying) -> @location(0) vec4<f32> {
+    return textureLoad(t_blit_source, vec2<i32>(input.position.xy), 0);
+}

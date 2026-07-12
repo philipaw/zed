@@ -92,6 +92,9 @@ struct WgpuPipelines {
     poly_sprites: wgpu::RenderPipeline,
     #[allow(dead_code)]
     surfaces: wgpu::RenderPipeline,
+    /// G1: fullscreen-triangle copy of the offscreen scene texture (T0)
+    /// to the drawable.
+    blit: wgpu::RenderPipeline,
 }
 
 struct WgpuBindGroupLayouts {
@@ -99,6 +102,7 @@ struct WgpuBindGroupLayouts {
     instances: wgpu::BindGroupLayout,
     instances_with_texture: wgpu::BindGroupLayout,
     surfaces: wgpu::BindGroupLayout,
+    blit: wgpu::BindGroupLayout,
 }
 
 /// Shared GPU context reference, used to coordinate device recovery across multiple windows.
@@ -120,6 +124,13 @@ struct WgpuResources {
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
+    /// G1: offscreen scene texture (T0). The whole frame renders here,
+    /// then a fullscreen blit copies it to the drawable. Same size and
+    /// format as the surface; recreated alongside the path intermediates
+    /// on resize/surface changes.
+    scene_texture: Option<wgpu::Texture>,
+    scene_view: Option<wgpu::TextureView>,
+    scene_blit_bind_group: Option<wgpu::BindGroup>,
 }
 
 impl WgpuResources {
@@ -128,6 +139,9 @@ impl WgpuResources {
         self.path_intermediate_view = None;
         self.path_msaa_texture = None;
         self.path_msaa_view = None;
+        self.scene_texture = None;
+        self.scene_view = None;
+        self.scene_blit_bind_group = None;
     }
 }
 
@@ -475,6 +489,9 @@ impl WgpuRenderer {
             path_intermediate_view: None,
             path_msaa_texture: None,
             path_msaa_view: None,
+            scene_texture: None,
+            scene_view: None,
+            scene_blit_bind_group: None,
         };
 
         Ok(Self {
@@ -575,6 +592,20 @@ impl WgpuRenderer {
                 ],
             });
 
+        let blit = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("blit_layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }],
+        });
+
         let surfaces = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("surfaces_layout"),
             entries: &[
@@ -624,6 +655,7 @@ impl WgpuRenderer {
             instances,
             instances_with_texture,
             surfaces,
+            blit,
         }
     }
 
@@ -889,6 +921,56 @@ impl WgpuRenderer {
             &shader_module,
         );
 
+        // G1: T0 → drawable copy. No blend (raw texel copy, alpha included)
+        // and no globals — the fullscreen triangle needs only the source
+        // texture. T0 shares the surface format, so `surface_format` is
+        // correct for both ends of the copy.
+        let blit = {
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("blit_pipeline_layout"),
+                bind_group_layouts: &[Some(&layouts.blit)],
+                immediate_size: 0,
+            });
+
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("blit"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader_module,
+                    entry_point: Some("vs_blit"),
+                    buffers: &[],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader_module,
+                    entry_point: Some("fs_blit"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState {
+                    count: 1,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+
         WgpuPipelines {
             quads,
             shadows,
@@ -899,6 +981,7 @@ impl WgpuRenderer {
             subpixel_sprites,
             poly_sprites,
             surfaces,
+            blit,
         }
     }
 
@@ -991,6 +1074,9 @@ impl WgpuRenderer {
             if let Some(ref texture) = resources.path_msaa_texture {
                 texture.destroy();
             }
+            if let Some(ref texture) = resources.scene_texture {
+                texture.destroy();
+            }
 
             resources
                 .surface
@@ -1004,7 +1090,9 @@ impl WgpuRenderer {
     }
 
     fn ensure_intermediate_textures(&mut self) {
-        if self.resources().path_intermediate_texture.is_some() {
+        if self.resources().path_intermediate_texture.is_some()
+            && self.resources().scene_texture.is_some()
+        {
             return;
         }
 
@@ -1029,6 +1117,39 @@ impl WgpuRenderer {
         .unwrap_or((None, None));
         resources.path_msaa_texture = path_msaa_texture;
         resources.path_msaa_view = path_msaa_view;
+
+        // G1: offscreen scene texture (T0) — the whole frame renders here
+        // and is then blitted to the drawable. Same size/format as the
+        // surface so every existing pipeline targets it unchanged.
+        let scene_texture = resources.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("scene_texture"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let scene_view = scene_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let scene_blit_bind_group =
+            resources
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("scene_blit_bind_group"),
+                    layout: &resources.bind_group_layouts.blit,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&scene_view),
+                    }],
+                });
+        resources.scene_texture = Some(scene_texture);
+        resources.scene_view = Some(scene_view);
+        resources.scene_blit_bind_group = Some(scene_blit_bind_group);
     }
 
     pub fn set_subpixel_layout(&mut self, is_bgr: bool) {
@@ -1163,6 +1284,16 @@ impl WgpuRenderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+        // G1: the whole scene renders into the offscreen T0; the drawable
+        // only ever receives the final fullscreen blit. (TextureView is a
+        // cheap handle clone — this avoids holding a borrow of `self`
+        // across the mutable calls below.)
+        let scene_view = self
+            .resources()
+            .scene_view
+            .clone()
+            .expect("scene texture created by ensure_intermediate_textures");
+
         let gamma_params = GammaParams {
             gamma_ratios: self.rendering_params.gamma_ratios,
             grayscale_enhanced_contrast: self.rendering_params.grayscale_enhanced_contrast,
@@ -1225,7 +1356,7 @@ impl WgpuRenderer {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("main_pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &frame_view,
+                        view: &scene_view,
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -1264,7 +1395,7 @@ impl WgpuRenderer {
                             pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                                 label: Some("main_pass_continued"),
                                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                    view: &frame_view,
+                                    view: &scene_view,
                                     resolve_target: None,
                                     ops: wgpu::Operations {
                                         load: wgpu::LoadOp::Load,
@@ -1337,6 +1468,36 @@ impl WgpuRenderer {
                 }
                 self.grow_instance_buffer();
                 continue;
+            }
+
+            // G1: blit T0 → drawable. The fullscreen triangle writes every
+            // pixel with no blending, so the load op never contributes.
+            {
+                let resources = self.resources();
+                let mut blit_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("blit_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &frame_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+                blit_pass.set_pipeline(&resources.pipelines.blit);
+                blit_pass.set_bind_group(
+                    0,
+                    resources
+                        .scene_blit_bind_group
+                        .as_ref()
+                        .expect("scene blit bind group created with scene texture"),
+                    &[],
+                );
+                blit_pass.draw(0..3, 0..1);
             }
 
             self.resources()
