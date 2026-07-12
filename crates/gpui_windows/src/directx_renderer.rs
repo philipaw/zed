@@ -338,6 +338,14 @@ impl DirectXRenderer {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
+                PrimitiveBatch::GlassPanels(range) => {
+                    // gem Track G: glass is a wgpu-renderer feature; the
+                    // DirectX path skips panels for now (gem ships on
+                    // iOS/macOS, and its solid mapping would need a
+                    // dedicated buffer in upload_scene_buffers).
+                    let _ = range;
+                    Ok(())
+                }
             }
             .context(format!(
                 "scene too large:\

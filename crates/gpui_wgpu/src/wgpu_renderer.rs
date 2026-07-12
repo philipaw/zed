@@ -1,9 +1,9 @@
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite, Path, Point,
-    PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size, SubpixelSprite,
-    Underline, get_gamma_correction_ratios,
+    AtlasTextureId, Background, Bounds, DevicePixels, GlassPanel, GpuSpecs, MonochromeSprite, Path,
+    Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
+    SubpixelSprite, Underline, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -1344,6 +1344,12 @@ impl WgpuRenderer {
         loop {
             let mut instance_offset: u64 = 0;
             let mut overflow = false;
+            // G2: the frame renders into T0 until the first GlassPanel
+            // batch; the blit then runs mid-frame and the remainder (the
+            // panels + everything ordered after them) renders directly to
+            // the drawable. Scenes without glass keep the G1 shape: the
+            // whole frame lands in T0 and the blit runs at the end.
+            let mut blitted = false;
 
             let mut encoder =
                 self.resources()
@@ -1353,6 +1359,7 @@ impl WgpuRenderer {
                     });
 
             {
+                let mut target_view = &scene_view;
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("main_pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1395,7 +1402,7 @@ impl WgpuRenderer {
                             pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                                 label: Some("main_pass_continued"),
                                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                    view: &scene_view,
+                                    view: target_view,
                                     resolve_target: None,
                                     ops: wgpu::Operations {
                                         load: wgpu::LoadOp::Load,
@@ -1448,6 +1455,38 @@ impl WgpuRenderer {
                             // Not implemented for Linux/wgpu
                             true
                         }
+                        PrimitiveBatch::GlassPanels(range) => {
+                            // G2: the first glass batch is the split point —
+                            // blit the backdrop (T0) to the drawable and
+                            // retarget the rest of the frame there. Later
+                            // glass batches are ordinary "after" content, so
+                            // glass never composites over glass.
+                            if !blitted {
+                                drop(pass);
+                                self.encode_blit(&mut encoder, &frame_view);
+                                blitted = true;
+                                target_view = &frame_view;
+                                pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                    label: Some("chrome_pass"),
+                                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                        view: target_view,
+                                        resolve_target: None,
+                                        ops: wgpu::Operations {
+                                            load: wgpu::LoadOp::Load,
+                                            store: wgpu::StoreOp::Store,
+                                        },
+                                        depth_slice: None,
+                                    })],
+                                    depth_stencil_attachment: None,
+                                    ..Default::default()
+                                });
+                            }
+                            self.draw_glass_panels(
+                                &scene.glass_panels[range],
+                                &mut instance_offset,
+                                &mut pass,
+                            )
+                        }
                     };
                     if !ok {
                         overflow = true;
@@ -1470,34 +1509,10 @@ impl WgpuRenderer {
                 continue;
             }
 
-            // G1: blit T0 → drawable. The fullscreen triangle writes every
-            // pixel with no blending, so the load op never contributes.
-            {
-                let resources = self.resources();
-                let mut blit_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("blit_pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &frame_view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                            store: wgpu::StoreOp::Store,
-                        },
-                        depth_slice: None,
-                    })],
-                    depth_stencil_attachment: None,
-                    ..Default::default()
-                });
-                blit_pass.set_pipeline(&resources.pipelines.blit);
-                blit_pass.set_bind_group(
-                    0,
-                    resources
-                        .scene_blit_bind_group
-                        .as_ref()
-                        .expect("scene blit bind group created with scene texture"),
-                    &[],
-                );
-                blit_pass.draw(0..3, 0..1);
+            // No glass this frame → the G1 shape: blit T0 → drawable at
+            // the end. (With glass, the blit already ran at the split.)
+            if !blitted {
+                self.encode_blit(&mut encoder, &frame_view);
             }
 
             self.resources()
@@ -1506,6 +1521,52 @@ impl WgpuRenderer {
             frame.present();
             return true;
         }
+    }
+
+    /// Encode the fullscreen T0 → drawable copy. Runs exactly once per
+    /// frame: mid-frame at the first GlassPanel batch (G2 split), or at
+    /// the end when the scene has no glass (G1 shape). The fullscreen
+    /// triangle writes every pixel with no blending, so the load op never
+    /// contributes.
+    fn encode_blit(&self, encoder: &mut wgpu::CommandEncoder, frame_view: &wgpu::TextureView) {
+        let resources = self.resources();
+        let mut blit_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("blit_pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: frame_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            ..Default::default()
+        });
+        blit_pass.set_pipeline(&resources.pipelines.blit);
+        blit_pass.set_bind_group(
+            0,
+            resources
+                .scene_blit_bind_group
+                .as_ref()
+                .expect("scene blit bind group created with scene texture"),
+            &[],
+        );
+        blit_pass.draw(0..3, 0..1);
+    }
+
+    /// G2: glass panels render their solid mapping — plain quads through
+    /// the existing quads pipeline. The blur/composite chain replaces this
+    /// in G3/G4.
+    fn draw_glass_panels(
+        &self,
+        panels: &[GlassPanel],
+        instance_offset: &mut u64,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> bool {
+        let quads: Vec<Quad> = panels.iter().map(|panel| panel.solid_quad()).collect();
+        self.draw_quads(&quads, instance_offset, pass)
     }
 
     fn draw_quads(

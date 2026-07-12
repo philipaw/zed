@@ -842,6 +842,22 @@ impl MetalRenderer {
                     viewport_size,
                     command_encoder,
                 ),
+                PrimitiveBatch::GlassPanels(range) => {
+                    // gem Track G: macOS draws the solid mapping (plain
+                    // quads); the glass split/blur chain lives in the wgpu
+                    // renderer only.
+                    let quads: Vec<Quad> = scene.glass_panels[range]
+                        .iter()
+                        .map(|panel| panel.solid_quad())
+                        .collect();
+                    self.draw_quads(
+                        &quads,
+                        instance_buffer,
+                        &mut instance_offset,
+                        viewport_size,
+                        command_encoder,
+                    )
+                }
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
             };
             if !ok {

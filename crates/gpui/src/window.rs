@@ -5,13 +5,13 @@ use crate::{
     AsyncWindowContext, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow, Capslock,
     Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
-    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
-    KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
-    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
-    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    EntityId, EventEmitter, FileDropEvent, FontId, GlassPanel, Global, GlobalElementId, GlyphId,
+    GpuSpecs, Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
+    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
+    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
+    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
+    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
@@ -3659,6 +3659,32 @@ impl Window {
             corner_radii: quad.corner_radii.scale(self.scale_factor()),
             border_widths: snapped_border_widths,
             border_style: quad.border_style,
+        });
+    }
+
+    /// Paint a glass panel (gem Track G) into the scene for the next frame at
+    /// the current z-index. The renderer splits the frame at the first glass
+    /// panel's draw order — everything painted before it is backdrop content,
+    /// the panel and everything after render on top. In G2 the panel renders
+    /// its solid mapping (a plain quad from `quad`); `strong` selects the
+    /// `FILL_STRONG` mapping for the blur/composite chain in later sittings.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_glass_panel(&mut self, quad: PaintQuad, strong: bool) {
+        self.invalidator.debug_assert_paint();
+
+        let opacity = self.element_opacity();
+        let snapped_bounds = self.snap_bounds(quad.bounds);
+        let snapped_border_widths = self.snap_border_widths(quad.border_widths);
+        self.next_frame.scene.insert_primitive(GlassPanel {
+            order: 0,
+            strong: strong as u32,
+            bounds: snapped_bounds,
+            content_mask: self.snapped_content_mask(),
+            background: quad.background.opacity(opacity),
+            border_color: quad.border_color.opacity(opacity),
+            corner_radii: quad.corner_radii.scale(self.scale_factor()),
+            border_widths: snapped_border_widths,
         });
     }
 

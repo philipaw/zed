@@ -36,6 +36,7 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    pub glass_panels: Vec<GlassPanel>,
 }
 
 #[expect(missing_docs)]
@@ -52,6 +53,7 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.glass_panels.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -119,6 +121,10 @@ impl Scene {
                 surface.order = order;
                 self.surfaces.push(surface.clone());
             }
+            Primitive::GlassPanel(panel) => {
+                panel.order = order;
+                self.glass_panels.push(*panel);
+            }
         }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
@@ -146,6 +152,7 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
+        self.glass_panels.sort_by_key(|panel| panel.order);
     }
 
     #[cfg_attr(
@@ -173,6 +180,8 @@ impl Scene {
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
+            glass_panels_start: 0,
+            glass_panels_iter: self.glass_panels.iter().peekable(),
         }
     }
 }
@@ -195,6 +204,7 @@ pub(crate) enum PrimitiveKind {
     SubpixelSprite,
     PolychromeSprite,
     Surface,
+    GlassPanel,
 }
 
 pub(crate) enum PaintOperation {
@@ -214,6 +224,7 @@ pub enum Primitive {
     SubpixelSprite(SubpixelSprite),
     PolychromeSprite(PolychromeSprite),
     Surface(PaintSurface),
+    GlassPanel(GlassPanel),
 }
 
 #[expect(missing_docs)]
@@ -228,6 +239,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
+            Primitive::GlassPanel(panel) => &panel.bounds,
         }
     }
 
@@ -241,6 +253,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
+            Primitive::GlassPanel(panel) => &panel.content_mask,
         }
     }
 }
@@ -269,6 +282,8 @@ struct BatchIterator<'a> {
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
+    glass_panels_start: usize,
+    glass_panels_iter: Peekable<slice::Iter<'a, GlassPanel>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -301,6 +316,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.surfaces_iter.peek().map(|s| s.order),
                 PrimitiveKind::Surface,
+            ),
+            (
+                self.glass_panels_iter.peek().map(|p| p.order),
+                PrimitiveKind::GlassPanel,
             ),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
@@ -447,6 +466,20 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.surfaces_start = surfaces_end;
                 Some(PrimitiveBatch::Surfaces(surfaces_start..surfaces_end))
             }
+            PrimitiveKind::GlassPanel => {
+                let panels_start = self.glass_panels_start;
+                let mut panels_end = panels_start + 1;
+                self.glass_panels_iter.next();
+                while self
+                    .glass_panels_iter
+                    .next_if(|panel| (panel.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    panels_end += 1;
+                }
+                self.glass_panels_start = panels_end;
+                Some(PrimitiveBatch::GlassPanels(panels_start..panels_end))
+            }
         }
     }
 }
@@ -479,6 +512,7 @@ pub enum PrimitiveBatch {
         range: Range<usize>,
     },
     Surfaces(Range<usize>),
+    GlassPanels(Range<usize>),
 }
 
 #[derive(Default, Debug, Copy, Clone)]
@@ -498,6 +532,55 @@ pub struct Quad {
 impl From<Quad> for Primitive {
     fn from(quad: Quad) -> Self {
         Primitive::Quad(quad)
+    }
+}
+
+/// A glass chrome surface (gem Track G). The renderer splits the frame at
+/// the first glass panel's draw order: everything painted before it becomes
+/// blur-able backdrop content; the panel and everything after render on top.
+/// Glass-on-glass is impossible by construction — later panels are ordinary
+/// "after" content. In G2 renderers draw the panel's solid mapping (a plain
+/// quad from these fields); the blur/composite chain lands in G3/G4.
+#[derive(Default, Debug, Copy, Clone)]
+#[repr(C)]
+pub struct GlassPanel {
+    /// Draw order assigned at insert, like every primitive.
+    pub order: DrawOrder,
+    /// 1 = `FILL_STRONG` mapping (PlayerDock/toolbars), 0 = `FILL`.
+    pub strong: u32,
+    /// Panel bounds in scaled pixels.
+    pub bounds: Bounds<ScaledPixels>,
+    /// Clip mask inherited from the paint context.
+    pub content_mask: ContentMask<ScaledPixels>,
+    /// The solid fallback mapping color (also the G4 overlay tint source).
+    pub background: Background,
+    /// Border color (G4 rim; drawn as a plain border in the solid mapping).
+    pub border_color: Hsla,
+    /// Rounded-rect radii (G4 SDF clip; plain quad radii in the mapping).
+    pub corner_radii: Corners<ScaledPixels>,
+    /// Border widths for the solid mapping.
+    pub border_widths: Edges<ScaledPixels>,
+}
+
+impl GlassPanel {
+    /// The G2 passthrough rendering: the panel as a plain solid quad.
+    pub fn solid_quad(&self) -> Quad {
+        Quad {
+            order: self.order,
+            border_style: BorderStyle::Solid,
+            bounds: self.bounds,
+            content_mask: self.content_mask,
+            background: self.background,
+            border_color: self.border_color,
+            corner_radii: self.corner_radii,
+            border_widths: self.border_widths,
+        }
+    }
+}
+
+impl From<GlassPanel> for Primitive {
+    fn from(panel: GlassPanel) -> Self {
+        Primitive::GlassPanel(panel)
     }
 }
 
