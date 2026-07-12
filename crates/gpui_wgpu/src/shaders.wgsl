@@ -1360,3 +1360,93 @@ fn vs_blit(@builtin(vertex_index) vertex_id: u32) -> BlitVarying {
 fn fs_blit(input: BlitVarying) -> @location(0) vec4<f32> {
     return textureLoad(t_blit_source, vec2<i32>(input.position.xy), 0);
 }
+
+// --- glass blur chain (G3) --- //
+// Dual-Kawase over the T0 backdrop: two downsample passes
+// (full → ½ → ¼) and two upsample passes (¼ → ½ → ½ ping-pong), each a
+// fullscreen triangle sampling the previous level. Offsets are tuned on
+// the Rust side so the whole chain lands at the D1 22pt
+// gaussian-equivalent. Runs once per frame, scissored to the union of
+// glass-panel regions.
+
+struct BlurParams {
+    // 1 / source texture size in texels.
+    src_texel: vec2<f32>,
+    // Kawase tap offset multiplier, in source texels.
+    offset: f32,
+    pad: f32,
+}
+
+@group(0) @binding(0) var t_blur_source: texture_2d<f32>;
+@group(0) @binding(1) var s_blur: sampler;
+@group(0) @binding(2) var<uniform> blur_params: BlurParams;
+
+struct BlurVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+}
+
+@vertex
+fn vs_blur(@builtin(vertex_index) vertex_id: u32) -> BlurVarying {
+    // Fullscreen triangle: (-1,-1), (3,-1), (-1,3) in clip space.
+    let corner = vec2<f32>(f32((vertex_id << 1u) & 2u), f32(vertex_id & 2u));
+    var out = BlurVarying();
+    out.position = vec4<f32>(corner * 2.0 - 1.0, 0.0, 1.0);
+    out.uv = vec2<f32>(corner.x, 1.0 - corner.y);
+    return out;
+}
+
+@fragment
+fn fs_blur_down(input: BlurVarying) -> @location(0) vec4<f32> {
+    let hp = blur_params.src_texel * blur_params.offset;
+    var sum = textureSample(t_blur_source, s_blur, input.uv) * 4.0;
+    sum += textureSample(t_blur_source, s_blur, input.uv - hp);
+    sum += textureSample(t_blur_source, s_blur, input.uv + hp);
+    sum += textureSample(t_blur_source, s_blur, input.uv + vec2<f32>(hp.x, -hp.y));
+    sum += textureSample(t_blur_source, s_blur, input.uv - vec2<f32>(hp.x, -hp.y));
+    return sum / 8.0;
+}
+
+@fragment
+fn fs_blur_up(input: BlurVarying) -> @location(0) vec4<f32> {
+    let hp = blur_params.src_texel * blur_params.offset;
+    var sum = textureSample(t_blur_source, s_blur, input.uv + vec2<f32>(-hp.x * 2.0, 0.0));
+    sum += textureSample(t_blur_source, s_blur, input.uv + vec2<f32>(-hp.x, hp.y)) * 2.0;
+    sum += textureSample(t_blur_source, s_blur, input.uv + vec2<f32>(0.0, hp.y * 2.0));
+    sum += textureSample(t_blur_source, s_blur, input.uv + vec2<f32>(hp.x, hp.y)) * 2.0;
+    sum += textureSample(t_blur_source, s_blur, input.uv + vec2<f32>(hp.x * 2.0, 0.0));
+    sum += textureSample(t_blur_source, s_blur, input.uv + vec2<f32>(hp.x, -hp.y)) * 2.0;
+    sum += textureSample(t_blur_source, s_blur, input.uv + vec2<f32>(0.0, -hp.y * 2.0));
+    sum += textureSample(t_blur_source, s_blur, input.uv + vec2<f32>(-hp.x, -hp.y)) * 2.0;
+    return sum / 12.0;
+}
+
+// --- glass panel composite (G3: flat) --- //
+// Draws each panel's bounds sampling the blurred backdrop at screen UV.
+// G3 is deliberately flat: no fill overlay, no SDF corner clip, no
+// refraction/rim — G4 replaces this fragment with the full optics stack.
+// Reuses the quads instance buffer (b_quads at group(1) binding(0)) and
+// the sprite texture/sampler slots for the blurred ½-res texture.
+
+struct GlassPanelVarying {
+    @builtin(position) position: vec4<f32>,
+}
+
+@vertex
+fn vs_glass_panel(
+    @builtin(vertex_index) vertex_id: u32,
+    @builtin(instance_index) instance_id: u32,
+) -> GlassPanelVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let quad = b_quads[instance_id];
+    var out = GlassPanelVarying();
+    out.position = to_device_position(unit_vertex, quad.bounds);
+    return out;
+}
+
+@fragment
+fn fs_glass_panel(input: GlassPanelVarying) -> @location(0) vec4<f32> {
+    let uv = input.position.xy / globals.viewport_size;
+    let blurred = textureSample(t_sprite, s_sprite, uv);
+    return vec4<f32>(blurred.rgb, 1.0);
+}

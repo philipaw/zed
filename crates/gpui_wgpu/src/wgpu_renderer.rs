@@ -54,6 +54,17 @@ struct GammaParams {
     _pad: u32,
 }
 
+/// G3: per-pass uniform of the blur chain (matches WGSL BlurParams).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct BlurParams {
+    /// 1 / source texture size in texels.
+    src_texel: [f32; 2],
+    /// Kawase tap offset multiplier, in source texels.
+    offset: f32,
+    pad: f32,
+}
+
 #[derive(Clone, Debug)]
 #[repr(C)]
 struct PathSprite {
@@ -95,6 +106,12 @@ struct WgpuPipelines {
     /// G1: fullscreen-triangle copy of the offscreen scene texture (T0)
     /// to the drawable.
     blit: wgpu::RenderPipeline,
+    /// G3: dual-Kawase downsample / upsample passes of the blur chain.
+    blur_down: wgpu::RenderPipeline,
+    blur_up: wgpu::RenderPipeline,
+    /// G3: glass panel composite — panel bounds sampling the blurred
+    /// backdrop flat (G4 replaces the fragment with the optics stack).
+    glass_composite: wgpu::RenderPipeline,
 }
 
 struct WgpuBindGroupLayouts {
@@ -103,6 +120,8 @@ struct WgpuBindGroupLayouts {
     instances_with_texture: wgpu::BindGroupLayout,
     surfaces: wgpu::BindGroupLayout,
     blit: wgpu::BindGroupLayout,
+    /// G3: one blur pass — source texture + sampler + BlurParams uniform.
+    blur: wgpu::BindGroupLayout,
 }
 
 /// Shared GPU context reference, used to coordinate device recovery across multiple windows.
@@ -131,6 +150,21 @@ struct WgpuResources {
     scene_texture: Option<wgpu::Texture>,
     scene_view: Option<wgpu::TextureView>,
     scene_blit_bind_group: Option<wgpu::BindGroup>,
+    /// G3: the blur pyramid — ½ (ping), ¼, ½ (pong). The chain is
+    /// D1 T0→half_a, D2 half_a→quarter, U1 quarter→half_b,
+    /// U2 half_b→half_a; the final blurred backdrop lives in half_a and
+    /// is bilinearly sampled by the glass composite. Sized from the
+    /// surface config; recreated with the other intermediates.
+    blur_half_a_texture: Option<wgpu::Texture>,
+    blur_half_a_view: Option<wgpu::TextureView>,
+    blur_quarter_texture: Option<wgpu::Texture>,
+    blur_quarter_view: Option<wgpu::TextureView>,
+    blur_half_b_texture: Option<wgpu::Texture>,
+    blur_half_b_view: Option<wgpu::TextureView>,
+    blur_params_buffer: Option<wgpu::Buffer>,
+    /// One bind group per blur pass (source view + sampler + params
+    /// slice), in chain order D1, D2, U1, U2.
+    blur_bind_groups: Option<Vec<wgpu::BindGroup>>,
 }
 
 impl WgpuResources {
@@ -142,6 +176,14 @@ impl WgpuResources {
         self.scene_texture = None;
         self.scene_view = None;
         self.scene_blit_bind_group = None;
+        self.blur_half_a_texture = None;
+        self.blur_half_a_view = None;
+        self.blur_quarter_texture = None;
+        self.blur_quarter_view = None;
+        self.blur_half_b_texture = None;
+        self.blur_half_b_view = None;
+        self.blur_params_buffer = None;
+        self.blur_bind_groups = None;
     }
 }
 
@@ -492,6 +534,14 @@ impl WgpuRenderer {
             scene_texture: None,
             scene_view: None,
             scene_blit_bind_group: None,
+            blur_half_a_texture: None,
+            blur_half_a_view: None,
+            blur_quarter_texture: None,
+            blur_quarter_view: None,
+            blur_half_b_texture: None,
+            blur_half_b_view: None,
+            blur_params_buffer: None,
+            blur_bind_groups: None,
         };
 
         Ok(Self {
@@ -606,6 +656,38 @@ impl WgpuRenderer {
             }],
         });
 
+        let blur = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("blur_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: NonZeroU64::new(std::mem::size_of::<BlurParams>() as u64),
+                    },
+                    count: None,
+                },
+            ],
+        });
+
         let surfaces = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("surfaces_layout"),
             entries: &[
@@ -656,6 +738,7 @@ impl WgpuRenderer {
             instances_with_texture,
             surfaces,
             blit,
+            blur,
         }
     }
 
@@ -916,7 +999,7 @@ impl WgpuRenderer {
             &layouts.globals,
             &layouts.surfaces,
             wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(color_target)],
+            &[Some(color_target.clone())],
             1,
             &shader_module,
         );
@@ -971,6 +1054,71 @@ impl WgpuRenderer {
             })
         };
 
+        // G3: the two dual-Kawase pass pipelines (fullscreen triangle,
+        // raw write like the blit) and the flat glass composite (panel
+        // bounds sampling the blurred backdrop; reuses the
+        // instances_with_texture layout so draw_instances_with_texture
+        // drives it with Quad instance data).
+        let make_blur_pipeline = |name: &str, fs_entry: &str| {
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(&format!("{name}_pipeline_layout")),
+                bind_group_layouts: &[Some(&layouts.blur)],
+                immediate_size: 0,
+            });
+
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(name),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader_module,
+                    entry_point: Some("vs_blur"),
+                    buffers: &[],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader_module,
+                    entry_point: Some(fs_entry),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState {
+                    count: 1,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let blur_down = make_blur_pipeline("blur_down", "fs_blur_down");
+        let blur_up = make_blur_pipeline("blur_up", "fs_blur_up");
+
+        let glass_composite = create_pipeline(
+            "glass_composite",
+            "vs_glass_panel",
+            "fs_glass_panel",
+            &layouts.globals,
+            &layouts.instances_with_texture,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(color_target)],
+            1,
+            &shader_module,
+        );
+
         WgpuPipelines {
             quads,
             shadows,
@@ -982,6 +1130,9 @@ impl WgpuRenderer {
             poly_sprites,
             surfaces,
             blit,
+            blur_down,
+            blur_up,
+            glass_composite,
         }
     }
 
@@ -1077,6 +1228,15 @@ impl WgpuRenderer {
             if let Some(ref texture) = resources.scene_texture {
                 texture.destroy();
             }
+            if let Some(ref texture) = resources.blur_half_a_texture {
+                texture.destroy();
+            }
+            if let Some(ref texture) = resources.blur_quarter_texture {
+                texture.destroy();
+            }
+            if let Some(ref texture) = resources.blur_half_b_texture {
+                texture.destroy();
+            }
 
             resources
                 .surface
@@ -1100,6 +1260,8 @@ impl WgpuRenderer {
         let width = self.surface_config.width;
         let height = self.surface_config.height;
         let path_sample_count = self.rendering_params.path_sample_count;
+        let o_down = self.rendering_params.blur_offset_down;
+        let o_up = self.rendering_params.blur_offset_up;
         let resources = self.resources_mut();
 
         let (t, v) = Self::create_path_intermediate(&resources.device, format, width, height);
@@ -1150,6 +1312,118 @@ impl WgpuRenderer {
         resources.scene_texture = Some(scene_texture);
         resources.scene_view = Some(scene_view);
         resources.scene_blit_bind_group = Some(scene_blit_bind_group);
+
+        // G3: the blur pyramid + per-pass bind groups. Half/quarter
+        // sizes derive from the surface config; the params slices are
+        // written once here (they only change with size or the tuned
+        // offsets, both of which recreate this whole block).
+        let half_w = (width / 2).max(1);
+        let half_h = (height / 2).max(1);
+        let quarter_w = (width / 4).max(1);
+        let quarter_h = (height / 4).max(1);
+        let make_blur_texture = |label: &str, w: u32, h: u32| {
+            let texture = resources.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            (texture, view)
+        };
+        let (half_a_tex, half_a_view) = make_blur_texture("blur_half_a", half_w, half_h);
+        let (quarter_tex, quarter_view) = make_blur_texture("blur_quarter", quarter_w, quarter_h);
+        let (half_b_tex, half_b_view) = make_blur_texture("blur_half_b", half_w, half_h);
+
+        let uniform_alignment = resources
+            .device
+            .limits()
+            .min_uniform_buffer_offset_alignment as u64;
+        let slice = std::mem::size_of::<BlurParams>() as u64;
+        let stride = slice.next_multiple_of(uniform_alignment);
+        let params_buffer = resources.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("blur_params"),
+            size: stride * 4,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        // Chain order D1, D2, U1, U2 — src sizes full, ½, ¼, ½.
+        let pass_params = [
+            (width, height, o_down),
+            (half_w, half_h, o_down),
+            (quarter_w, quarter_h, o_up),
+            (half_w, half_h, o_up),
+        ];
+        for (i, (src_w, src_h, offset)) in pass_params.iter().enumerate() {
+            let params = BlurParams {
+                src_texel: [1.0 / *src_w as f32, 1.0 / *src_h as f32],
+                offset: *offset,
+                pad: 0.0,
+            };
+            resources.queue.write_buffer(
+                &params_buffer,
+                stride * i as u64,
+                bytemuck::bytes_of(&params),
+            );
+        }
+
+        // Per-pass bind groups: source view + linear clamp sampler
+        // (atlas_sampler is linear + clamp-to-edge by default) + params.
+        let scene_view_ref = resources
+            .scene_view
+            .as_ref()
+            .expect("scene view created above");
+        let sources = [scene_view_ref, &half_a_view, &quarter_view, &half_b_view];
+        let blur_bind_groups = sources
+            .iter()
+            .enumerate()
+            .map(|(i, src_view)| {
+                resources
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("blur_pass_bind_group"),
+                        layout: &resources.bind_group_layouts.blur,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(src_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::Sampler(&resources.atlas_sampler),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                    buffer: &params_buffer,
+                                    offset: stride * i as u64,
+                                    size: Some(
+                                        NonZeroU64::new(slice).expect("BlurParams non-zero"),
+                                    ),
+                                }),
+                            },
+                        ],
+                    })
+            })
+            .collect::<Vec<_>>();
+
+        resources.blur_half_a_texture = Some(half_a_tex);
+        resources.blur_half_a_view = Some(half_a_view);
+        resources.blur_quarter_texture = Some(quarter_tex);
+        resources.blur_quarter_view = Some(quarter_view);
+        resources.blur_half_b_texture = Some(half_b_tex);
+        resources.blur_half_b_view = Some(half_b_view);
+        resources.blur_params_buffer = Some(params_buffer);
+        resources.blur_bind_groups = Some(blur_bind_groups);
     }
 
     pub fn set_subpixel_layout(&mut self, is_bgr: bool) {
@@ -1293,6 +1567,16 @@ impl WgpuRenderer {
             .scene_view
             .clone()
             .expect("scene texture created by ensure_intermediate_textures");
+
+        // G3: the blur chain runs once per frame over the union of the
+        // visible glass regions. glass_panels is fully sorted/clipped by
+        // Scene::finish, so this is a straight fold.
+        let glass_union: Option<Bounds<ScaledPixels>> = scene
+            .glass_panels
+            .iter()
+            .map(|panel| panel.bounds.intersect(&panel.content_mask.bounds))
+            .filter(|bounds| !bounds.is_empty())
+            .reduce(|a, b| a.union(&b));
 
         let gamma_params = GammaParams {
             gamma_ratios: self.rendering_params.gamma_ratios,
@@ -1463,6 +1747,12 @@ impl WgpuRenderer {
                             // glass never composites over glass.
                             if !blitted {
                                 drop(pass);
+                                // T0 is complete here (every batch below
+                                // the first panel has drawn) — run the
+                                // shared blur chain, then the blit.
+                                if let Some(union_bounds) = glass_union {
+                                    self.encode_blur_chain(&mut encoder, union_bounds);
+                                }
                                 self.encode_blit(&mut encoder, &frame_view);
                                 blitted = true;
                                 target_view = &frame_view;
@@ -1556,9 +1846,100 @@ impl WgpuRenderer {
         blit_pass.draw(0..3, 0..1);
     }
 
-    /// G2: glass panels render their solid mapping — plain quads through
-    /// the existing quads pipeline. The blur/composite chain replaces this
-    /// in G3/G4.
+    /// G3: encode the shared blur chain — dual-Kawase 2+2 over the ½/¼
+    /// pyramid, scissored to the union of visible glass regions (padded
+    /// by the kernel's cumulative reach). Each pass clears its whole
+    /// attachment (scratch textures) and draws a scissored fullscreen
+    /// triangle. Runs once per frame, only when the scene has glass.
+    fn encode_blur_chain(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        union_bounds: Bounds<ScaledPixels>,
+    ) {
+        let resources = self.resources();
+        let (Some(half_a), Some(quarter), Some(half_b), Some(bind_groups)) = (
+            resources.blur_half_a_view.as_ref(),
+            resources.blur_quarter_view.as_ref(),
+            resources.blur_half_b_view.as_ref(),
+            resources.blur_bind_groups.as_ref(),
+        ) else {
+            return;
+        };
+
+        let width = self.surface_config.width;
+        let height = self.surface_config.height;
+        let half_dims = ((width / 2).max(1), (height / 2).max(1));
+        let quarter_dims = ((width / 4).max(1), (height / 4).max(1));
+
+        // Padding covers the chain's cumulative tap reach so texels the
+        // panels sample never depend on cleared-out-of-scissor regions.
+        let o_down = self.rendering_params.blur_offset_down;
+        let o_up = self.rendering_params.blur_offset_up;
+        let pad = o_down * 4.0 + o_up * 16.0;
+        let x0 = union_bounds.origin.x.0 - pad;
+        let y0 = union_bounds.origin.y.0 - pad;
+        let x1 = union_bounds.origin.x.0 + union_bounds.size.width.0 + pad;
+        let y1 = union_bounds.origin.y.0 + union_bounds.size.height.0 + pad;
+        let scissor = |scale: f32, dims: (u32, u32)| -> (u32, u32, u32, u32) {
+            let sx0 = ((x0 / scale).floor().max(0.0) as u32).min(dims.0 - 1);
+            let sy0 = ((y0 / scale).floor().max(0.0) as u32).min(dims.1 - 1);
+            let sx1 = ((x1 / scale).ceil().max(0.0) as u32).clamp(sx0 + 1, dims.0);
+            let sy1 = ((y1 / scale).ceil().max(0.0) as u32).clamp(sy0 + 1, dims.1);
+            (sx0, sy0, sx1 - sx0, sy1 - sy0)
+        };
+
+        // Chain order D1, D2, U1, U2 (matches the bind-group order).
+        let passes: [(
+            &wgpu::TextureView,
+            &wgpu::RenderPipeline,
+            (u32, u32, u32, u32),
+        ); 4] = [
+            (
+                half_a,
+                &resources.pipelines.blur_down,
+                scissor(2.0, half_dims),
+            ),
+            (
+                quarter,
+                &resources.pipelines.blur_down,
+                scissor(4.0, quarter_dims),
+            ),
+            (
+                half_b,
+                &resources.pipelines.blur_up,
+                scissor(2.0, half_dims),
+            ),
+            (
+                half_a,
+                &resources.pipelines.blur_up,
+                scissor(2.0, half_dims),
+            ),
+        ];
+        for (i, (dest_view, pipeline, (sx, sy, sw, sh))) in passes.iter().enumerate() {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("blur_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: dest_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            pass.set_scissor_rect(*sx, *sy, *sw, *sh);
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bind_groups[i], &[]);
+            pass.draw(0..3, 0..1);
+        }
+    }
+
+    /// G3: glass panels sample the blurred backdrop flat (opaque, square
+    /// corners; the G4 optics stack replaces the fragment). Falls back to
+    /// the G2 solid mapping if the blur pyramid is unavailable.
     fn draw_glass_panels(
         &self,
         panels: &[GlassPanel],
@@ -1566,7 +1947,19 @@ impl WgpuRenderer {
         pass: &mut wgpu::RenderPass<'_>,
     ) -> bool {
         let quads: Vec<Quad> = panels.iter().map(|panel| panel.solid_quad()).collect();
-        self.draw_quads(&quads, instance_offset, pass)
+        let resources = self.resources();
+        let Some(blur_view) = resources.blur_half_a_view.as_ref() else {
+            return self.draw_quads(&quads, instance_offset, pass);
+        };
+        let data = unsafe { Self::instance_bytes(&quads) };
+        self.draw_instances_with_texture(
+            data,
+            quads.len() as u32,
+            blur_view,
+            &resources.pipelines.glass_composite,
+            instance_offset,
+            pass,
+        )
     }
 
     fn draw_quads(
@@ -2102,6 +2495,13 @@ struct RenderingParameters {
     gamma_ratios: [f32; 4],
     grayscale_enhanced_contrast: f32,
     subpixel_enhanced_contrast: f32,
+    /// G3: dual-Kawase tap offsets (source texels) for the down / up
+    /// passes. Defaults are tuned so the 2+2 chain over the ½/¼ pyramid
+    /// lands at the D1 22pt gaussian-equivalent (σ ≈ 66 device px @3x);
+    /// `GEM_BLUR_OFFSET_DOWN` / `GEM_BLUR_OFFSET_UP` override for tuning
+    /// without a rebuild (the ZED_FONTS_GAMMA pattern).
+    blur_offset_down: f32,
+    blur_offset_up: f32,
 }
 
 impl RenderingParameters {
@@ -2133,11 +2533,25 @@ impl RenderingParameters {
             .unwrap_or(0.5_f32)
             .max(0.0);
 
+        let blur_offset_down = env::var("GEM_BLUR_OFFSET_DOWN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(12.2_f32)
+            .clamp(0.0, 64.0);
+
+        let blur_offset_up = env::var("GEM_BLUR_OFFSET_UP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(12.2_f32)
+            .clamp(0.0, 64.0);
+
         Self {
             path_sample_count,
             gamma_ratios,
             grayscale_enhanced_contrast,
             subpixel_enhanced_contrast,
+            blur_offset_down,
+            blur_offset_up,
         }
     }
 }
