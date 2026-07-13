@@ -1937,24 +1937,69 @@ impl WgpuRenderer {
         }
     }
 
-    /// G3: glass panels sample the blurred backdrop flat (opaque, square
-    /// corners; the G4 optics stack replaces the fragment). Falls back to
-    /// the G2 solid mapping if the blur pyramid is unavailable.
+    /// G4: glass panels composite the blurred backdrop with the full
+    /// optics stack (fs_glass_panel), with `effect::SHADOW_FLOAT`
+    /// rendered beneath via the existing shadows pipeline. Falls back to
+    /// the G2 solid mapping if the blur pyramid is unavailable — the G5
+    /// fallback path.
     fn draw_glass_panels(
         &self,
         panels: &[GlassPanel],
         instance_offset: &mut u64,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> bool {
-        let quads: Vec<Quad> = panels.iter().map(|panel| panel.solid_quad()).collect();
         let resources = self.resources();
-        let Some(blur_view) = resources.blur_half_a_view.as_ref() else {
+        if resources.blur_half_a_view.is_none() {
+            let quads: Vec<Quad> = panels.iter().map(|panel| panel.solid_quad()).collect();
             return self.draw_quads(&quads, instance_offset, pass);
-        };
-        let data = unsafe { Self::instance_bytes(&quads) };
+        }
+
+        // SHADOW_FLOAT beneath (tokens.rs effect::SHADOW_FLOAT =
+        // (dx 0, dy 10, blur 30, alpha .45), black).
+        let shadows: Vec<Shadow> = panels
+            .iter()
+            .map(|panel| {
+                let scale = panel.scale.max(1.0);
+                Shadow {
+                    order: panel.order,
+                    blur_radius: ScaledPixels(30.0 * scale),
+                    bounds: Bounds {
+                        origin: Point {
+                            x: panel.bounds.origin.x,
+                            y: ScaledPixels(panel.bounds.origin.y.0 + 10.0 * scale),
+                        },
+                        size: panel.bounds.size,
+                    },
+                    corner_radii: panel.corner_radii,
+                    content_mask: panel.content_mask,
+                    color: gpui::Hsla {
+                        h: 0.0,
+                        s: 0.0,
+                        l: 0.0,
+                        a: 0.45,
+                    },
+                }
+            })
+            .collect();
+        if !self.draw_shadows(&shadows, instance_offset, pass) {
+            return false;
+        }
+
+        // The spare `pad` field carries the refraction strength (f32
+        // bits) so the shader reads the env-tunable value without a
+        // dedicated uniform (GEM_REFRACT_STRENGTH_PT; 0 disables).
+        let mut panels_data = panels.to_vec();
+        let strength_bits = self.rendering_params.refract_strength_pt.to_bits();
+        for panel in &mut panels_data {
+            panel.pad = strength_bits;
+        }
+
+        let resources = self.resources();
+        let blur_view = resources.blur_half_a_view.as_ref().expect("checked above");
+        let data = unsafe { Self::instance_bytes(&panels_data) };
         self.draw_instances_with_texture(
             data,
-            quads.len() as u32,
+            panels_data.len() as u32,
             blur_view,
             &resources.pipelines.glass_composite,
             instance_offset,
@@ -2502,6 +2547,12 @@ struct RenderingParameters {
     /// without a rebuild (the ZED_FONTS_GAMMA pattern).
     blur_offset_down: f32,
     blur_offset_up: f32,
+    /// G4: max edge-refraction displacement in pt (token
+    /// REFRACT_STRENGTH_PT = 6.0). `GEM_REFRACT_STRENGTH_PT` overrides —
+    /// 0 disables displacement, which the REFR1 verdict's off-run and
+    /// D4 device tuning both use. Carried to the shader per panel in
+    /// the spare `pad` field (f32 bits).
+    refract_strength_pt: f32,
 }
 
 impl RenderingParameters {
@@ -2545,6 +2596,12 @@ impl RenderingParameters {
             .unwrap_or(12.2_f32)
             .clamp(0.0, 64.0);
 
+        let refract_strength_pt = env::var("GEM_REFRACT_STRENGTH_PT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(6.0_f32)
+            .clamp(0.0, 24.0);
+
         Self {
             path_sample_count,
             gamma_ratios,
@@ -2552,6 +2609,7 @@ impl RenderingParameters {
             subpixel_enhanced_contrast,
             blur_offset_down,
             blur_offset_up,
+            refract_strength_pt,
         }
     }
 }

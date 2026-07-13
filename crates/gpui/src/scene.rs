@@ -548,6 +548,13 @@ pub struct GlassPanel {
     pub order: DrawOrder,
     /// 1 = `FILL_STRONG` mapping (PlayerDock/toolbars), 0 = `FILL`.
     pub strong: u32,
+    /// Scale factor at paint time — the G4 composite shader converts the
+    /// pt-denominated optics tokens (refraction band, rim width, glow
+    /// softness) into device pixels with it.
+    pub scale: f32,
+    /// Keeps `bounds` at a 16-byte offset so the WGSL mirror (vec2
+    /// alignment 8) matches this repr(C) layout.
+    pub pad: u32,
     /// Panel bounds in scaled pixels.
     pub bounds: Bounds<ScaledPixels>,
     /// Clip mask inherited from the paint context.

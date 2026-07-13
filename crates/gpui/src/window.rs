@@ -3679,6 +3679,8 @@ impl Window {
         self.next_frame.scene.insert_primitive(GlassPanel {
             order: 0,
             strong: strong as u32,
+            scale: self.scale_factor(),
+            pad: 0,
             bounds: snapped_bounds,
             content_mask: self.snapped_content_mask(),
             background: quad.background.opacity(opacity),

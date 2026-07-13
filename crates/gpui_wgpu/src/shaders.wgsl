@@ -1421,15 +1421,73 @@ fn fs_blur_up(input: BlurVarying) -> @location(0) vec4<f32> {
     return sum / 12.0;
 }
 
-// --- glass panel composite (G3: flat) --- //
-// Draws each panel's bounds sampling the blurred backdrop at screen UV.
-// G3 is deliberately flat: no fill overlay, no SDF corner clip, no
-// refraction/rim — G4 replaces this fragment with the full optics stack.
-// Reuses the quads instance buffer (b_quads at group(1) binding(0)) and
-// the sprite texture/sampler slots for the blurred ½-res texture.
+// --- glass panel composite (G4: full optics) --- //
+// Draws each panel's bounds compositing the blurred backdrop with the
+// gem glass optics stack (tokens.rs `glass::` / `effect::` — values are
+// the D4 STARTING points; final tuning happens on device against the
+// Apple Music reference captures):
+//   1. rounded-rect SDF clip (anti-aliased) from the primitive's radii
+//   2. edge refraction — backdrop UV displaced along the SDF gradient
+//      (REFRACT_BAND_PT 10, REFRACT_STRENGTH_PT 6, quadratic ease-in)
+//   3. saturation ×1.8 on the sampled backdrop (Rec.709 luma, gamma
+//      space)
+//   4. FILL / FILL_STRONG overlay per `strong`, with a
+//      luminance-adaptive alpha ramp above backdrop luma .55 (contrast
+//      insurance over bright content — the static token alphas alone
+//      cap white-text contrast at ≈4.1:1 over pure white; see the FILL
+//      "floor .35" adaptivity note in tokens.rs)
+//   5. HIGHLIGHT top gradient (.08 → 0 by 34% height)
+//   6. EDGE_GLOW inner band (softness 22pt, cubic falloff; alphas
+//      .52/.34/.30 top/bottom/sides by SDF-gradient orientation)
+//   7. RIM 0.5pt inner stroke (.55 top → .22 bottom)
+//   8. 1px border white@.10 (inner ring)
+// SHADOW_FLOAT renders separately beneath via the shadows pipeline.
+// G5 hooks: the whole stack collapses to the solid mapping when the
+// renderer falls back (draw_glass_panels' no-blur-pyramid branch).
+
+struct GlassPanel {
+    order: u32,
+    strong: u32,
+    scale: f32,
+    pad: u32,
+    bounds: Bounds,
+    content_mask: Bounds,
+    background: Background,
+    border_color: Hsla,
+    corner_radii: Corners,
+    border_widths: Edges,
+}
+
+@group(1) @binding(0) var<storage, read> b_glass_panels: array<GlassPanel>;
+
+// tokens.rs glass:: (rgb components pre-divided by 255)
+const GLASS_FILL: vec4<f32> = vec4<f32>(0.09412, 0.10196, 0.12941, 0.40); // 0x181A21 @ .40
+const GLASS_FILL_STRONG: vec4<f32> = vec4<f32>(0.06667, 0.07451, 0.09804, 0.55); // 0x111319 @ .55
+const GLASS_BORDER_ALPHA: f32 = 0.10;
+const GLASS_HIGHLIGHT_ALPHA: f32 = 0.08;
+const GLASS_HIGHLIGHT_STOP: f32 = 0.34;
+const GLASS_SATURATION: f32 = 1.8;
+const GLASS_RIM_ALPHA_TOP: f32 = 0.55;
+const GLASS_RIM_ALPHA_BOTTOM: f32 = 0.22;
+const GLASS_RIM_WIDTH_PT: f32 = 0.5;
+const GLASS_EDGE_GLOW_SOFT_PT: f32 = 22.0;
+const GLASS_EDGE_GLOW_TOP: f32 = 0.52;
+const GLASS_EDGE_GLOW_BOTTOM: f32 = 0.34;
+const GLASS_EDGE_GLOW_SIDES: f32 = 0.30;
+const GLASS_REFRACT_BAND_PT: f32 = 10.0;
+// GLASS_REFRACT_STRENGTH_PT (6.0) is applied renderer-side and carried
+// in the panel's `pad` field so GEM_REFRACT_STRENGTH_PT can retune it.
+// Adaptive-overlay ramp (deviation from the static CSS numbers — see
+// header comment): engages above backdrop luma .55, adds up to .35
+// alpha, capped at .90 total.
+const GLASS_ADAPT_LUMA_LO: f32 = 0.55;
+const GLASS_ADAPT_LUMA_HI: f32 = 0.95;
+const GLASS_ADAPT_ALPHA: f32 = 0.35;
+const GLASS_ADAPT_ALPHA_CAP: f32 = 0.90;
 
 struct GlassPanelVarying {
     @builtin(position) position: vec4<f32>,
+    @location(0) @interpolate(flat) panel_id: u32,
 }
 
 @vertex
@@ -1438,15 +1496,95 @@ fn vs_glass_panel(
     @builtin(instance_index) instance_id: u32,
 ) -> GlassPanelVarying {
     let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
-    let quad = b_quads[instance_id];
+    let panel = b_glass_panels[instance_id];
     var out = GlassPanelVarying();
-    out.position = to_device_position(unit_vertex, quad.bounds);
+    out.position = to_device_position(unit_vertex, panel.bounds);
+    out.panel_id = instance_id;
     return out;
 }
 
 @fragment
 fn fs_glass_panel(input: GlassPanelVarying) -> @location(0) vec4<f32> {
-    let uv = input.position.xy / globals.viewport_size;
-    let blurred = textureSample(t_sprite, s_sprite, uv);
-    return vec4<f32>(blurred.rgb, 1.0);
+    let panel = b_glass_panels[input.panel_id];
+    let scale = max(panel.scale, 1.0);
+    let pos = input.position.xy;
+
+    // 1. Rounded-rect SDF (negative inside).
+    let half_size = panel.bounds.size / 2.0;
+    let center = panel.bounds.origin + half_size;
+    let center_to_point = pos - center;
+    let corner_radius = pick_corner_radius(center_to_point, panel.corner_radii);
+    let corner_to_point = abs(center_to_point) - half_size;
+    let corner_center_to_point = corner_to_point + corner_radius;
+    let d = quad_sdf_impl(corner_center_to_point, corner_radius);
+    let aa = saturate(0.5 - d);
+
+    // Outward SDF gradient (unit normal of the nearest edge).
+    var grad: vec2<f32>;
+    if (corner_center_to_point.x > 0.0 && corner_center_to_point.y > 0.0) {
+        grad = normalize(corner_center_to_point)
+            * vec2<f32>(sign(center_to_point.x), sign(center_to_point.y));
+    } else if (corner_center_to_point.x > corner_center_to_point.y) {
+        grad = vec2<f32>(sign(center_to_point.x), 0.0);
+    } else {
+        grad = vec2<f32>(0.0, sign(center_to_point.y));
+    }
+
+    // 2. Edge refraction: displace the backdrop sample along the SDF
+    // gradient inside the band, quadratic ease-in toward the rim.
+    let band = GLASS_REFRACT_BAND_PT * scale;
+    let ease = saturate(1.0 + d / band);
+    // Strength arrives per panel in the spare `pad` field (f32 bits) so
+    // GEM_REFRACT_STRENGTH_PT tunes it without a rebuild; the token
+    // default is GLASS_REFRACT_STRENGTH_PT (6.0).
+    let strength = bitcast<f32>(panel.pad);
+    let disp = strength * scale * ease * ease;
+    let uv = (pos + grad * disp) / globals.viewport_size;
+    var c = textureSampleLevel(t_sprite, s_sprite, uv, 0.0).rgb;
+
+    // 3. Saturation boost.
+    let luma = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+    c = clamp(mix(vec3<f32>(luma), c, GLASS_SATURATION), vec3<f32>(0.0), vec3<f32>(1.0));
+
+    // 4. FILL / FILL_STRONG overlay, luminance-adaptive over bright
+    // backdrops.
+    let fill = select(GLASS_FILL, GLASS_FILL_STRONG, panel.strong != 0u);
+    let adapt = GLASS_ADAPT_ALPHA * smoothstep(GLASS_ADAPT_LUMA_LO, GLASS_ADAPT_LUMA_HI, luma);
+    let fill_a = min(fill.a + adapt, GLASS_ADAPT_ALPHA_CAP);
+    c = mix(c, fill.rgb, fill_a);
+
+    // 5. Highlight: top white gradient.
+    let hy = saturate((pos.y - panel.bounds.origin.y) / max(panel.bounds.size.y, 1.0));
+    let highlight = GLASS_HIGHLIGHT_ALPHA * saturate(1.0 - hy / GLASS_HIGHLIGHT_STOP);
+    c = mix(c, vec3<f32>(1.0), highlight);
+
+    // 6. Edge glow: light collects at the rim (cubic falloff inward
+    // over the softness band; alpha by nearest-edge orientation).
+    let glow_soft = GLASS_EDGE_GLOW_SOFT_PT * scale;
+    var glow_alpha = GLASS_EDGE_GLOW_SIDES;
+    if (grad.y < -0.7) {
+        glow_alpha = GLASS_EDGE_GLOW_TOP;
+    } else if (grad.y > 0.7) {
+        glow_alpha = GLASS_EDGE_GLOW_BOTTOM;
+    }
+    let glow_t = saturate(1.0 + d / glow_soft);
+    let glow = glow_alpha * glow_t * glow_t * glow_t;
+    c = mix(c, vec3<f32>(1.0), glow);
+
+    // 7. Rim: 0.5pt inner stroke, alpha lerped top → bottom.
+    let rim_w = GLASS_RIM_WIDTH_PT * scale;
+    var rim = 0.0;
+    if (d > -(rim_w + 0.5)) {
+        rim = mix(GLASS_RIM_ALPHA_TOP, GLASS_RIM_ALPHA_BOTTOM, hy);
+    }
+    c = mix(c, vec3<f32>(1.0), rim);
+
+    // 8. 1px border white@.10 (inner ring just inside the rim).
+    var border = 0.0;
+    if (d > -(rim_w + 1.0 + 0.5) && d <= -(rim_w + 0.5)) {
+        border = GLASS_BORDER_ALPHA;
+    }
+    c = mix(c, vec3<f32>(1.0), border);
+
+    return blend_color(vec4<f32>(c, 1.0), aa);
 }
