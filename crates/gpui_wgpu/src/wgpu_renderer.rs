@@ -124,6 +124,12 @@ struct WgpuBindGroupLayouts {
     blur: wgpu::BindGroupLayout,
 }
 
+/// G5: at most this many glass surfaces may composite per frame —
+/// mirrors gem's `tokens::glass::MAX_SURFACES_PER_SCREEN` (dock + bar +
+/// toast is the ceiling). Debug builds assert; release builds render
+/// over-budget panels (by draw order) with the solid mapping.
+const GLASS_MAX_SURFACES: usize = 3;
+
 /// Shared GPU context reference, used to coordinate device recovery across multiple windows.
 pub type GpuContext = Rc<RefCell<Option<WgpuContext>>>;
 
@@ -214,6 +220,14 @@ pub struct WgpuRenderer {
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     surface_configured: bool,
     needs_redraw: bool,
+    /// G5: when true every glass panel renders its solid mapping and the
+    /// blur chain never runs — the reduce-transparency / thermal /
+    /// low-power fallback. Initialized from `GEM_GLASS_OFF`; the app's
+    /// 0i triggers flip it via [`set_glass_enabled`](Self::set_glass_enabled).
+    glass_off: bool,
+    /// G5 budget log throttle: the panel count last reported over budget
+    /// (log once per frame-shape, not per frame).
+    last_over_budget: usize,
 }
 
 impl WgpuRenderer {
@@ -567,6 +581,10 @@ impl WgpuRenderer {
             device_lost: context.device_lost_flag(),
             surface_configured: true,
             needs_redraw: false,
+            glass_off: std::env::var("GEM_GLASS_OFF")
+                .map(|v| !v.is_empty() && v != "0")
+                .unwrap_or(false),
+            last_over_budget: 0,
         })
     }
 
@@ -1568,15 +1586,45 @@ impl WgpuRenderer {
             .clone()
             .expect("scene texture created by ensure_intermediate_textures");
 
+        // G5: the fallback switch — solid mapping everywhere, no blur.
+        let glass_off = self.glass_off;
+
+        // G5: budget — at most GLASS_MAX_SURFACES panels composite per
+        // frame. Debug builds assert; release renders the overflow (by
+        // draw order) with the solid mapping, logged once per
+        // frame-shape.
+        let panel_count = scene.glass_panels.len();
+        if !glass_off {
+            debug_assert!(
+                panel_count <= GLASS_MAX_SURFACES,
+                "gem glass budget exceeded: {panel_count} glass panels > \
+                 GLASS_MAX_SURFACES ({GLASS_MAX_SURFACES}, tokens \
+                 MAX_SURFACES_PER_SCREEN); over-budget panels render the \
+                 solid mapping in release builds"
+            );
+            if panel_count > GLASS_MAX_SURFACES && self.last_over_budget != panel_count {
+                self.last_over_budget = panel_count;
+                log::warn!(
+                    "gem glass budget exceeded: {panel_count} panels > {GLASS_MAX_SURFACES}; \
+                     rendering the overflow with the solid mapping"
+                );
+            }
+        }
+
         // G3: the blur chain runs once per frame over the union of the
         // visible glass regions. glass_panels is fully sorted/clipped by
-        // Scene::finish, so this is a straight fold.
-        let glass_union: Option<Bounds<ScaledPixels>> = scene
-            .glass_panels
-            .iter()
-            .map(|panel| panel.bounds.intersect(&panel.content_mask.bounds))
-            .filter(|bounds| !bounds.is_empty())
-            .reduce(|a, b| a.union(&b));
+        // Scene::finish, so this is a straight fold. With glass off the
+        // chain is skipped entirely (no union, no split, no blit-mid).
+        let glass_union: Option<Bounds<ScaledPixels>> = if glass_off {
+            None
+        } else {
+            scene
+                .glass_panels
+                .iter()
+                .map(|panel| panel.bounds.intersect(&panel.content_mask.bounds))
+                .filter(|bounds| !bounds.is_empty())
+                .reduce(|a, b| a.union(&b))
+        };
 
         let gamma_params = GammaParams {
             gamma_ratios: self.rendering_params.gamma_ratios,
@@ -1634,6 +1682,8 @@ impl WgpuRenderer {
             // the drawable. Scenes without glass keep the G1 shape: the
             // whole frame lands in T0 and the blit runs at the end.
             let mut blitted = false;
+            // G5: how many panels have composited this frame (budget).
+            let mut glass_drawn: usize = 0;
 
             let mut encoder =
                 self.resources()
@@ -1740,42 +1790,59 @@ impl WgpuRenderer {
                             true
                         }
                         PrimitiveBatch::GlassPanels(range) => {
-                            // G2: the first glass batch is the split point —
-                            // blit the backdrop (T0) to the drawable and
-                            // retarget the rest of the frame there. Later
-                            // glass batches are ordinary "after" content, so
-                            // glass never composites over glass.
-                            if !blitted {
-                                drop(pass);
-                                // T0 is complete here (every batch below
-                                // the first panel has drawn) — run the
-                                // shared blur chain, then the blit.
-                                if let Some(union_bounds) = glass_union {
-                                    self.encode_blur_chain(&mut encoder, union_bounds);
+                            if glass_off {
+                                // G5: fallback — solid mapping straight
+                                // into the current target; no split, no
+                                // blur, no mid-frame blit. Draw order is
+                                // preserved, so z-order matches the glass
+                                // path exactly (zero layout shift).
+                                self.draw_glass_panels_solid(
+                                    &scene.glass_panels[range],
+                                    &mut instance_offset,
+                                    &mut pass,
+                                )
+                            } else {
+                                // G2: the first glass batch is the split
+                                // point — blit the backdrop (T0) to the
+                                // drawable and retarget the rest of the
+                                // frame there. Later glass batches are
+                                // ordinary "after" content, so glass
+                                // never composites over glass.
+                                if !blitted {
+                                    drop(pass);
+                                    // T0 is complete here (every batch below
+                                    // the first panel has drawn) — run the
+                                    // shared blur chain, then the blit.
+                                    if let Some(union_bounds) = glass_union {
+                                        self.encode_blur_chain(&mut encoder, union_bounds);
+                                    }
+                                    self.encode_blit(&mut encoder, &frame_view);
+                                    blitted = true;
+                                    target_view = &frame_view;
+                                    pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                        label: Some("chrome_pass"),
+                                        color_attachments: &[Some(
+                                            wgpu::RenderPassColorAttachment {
+                                                view: target_view,
+                                                resolve_target: None,
+                                                ops: wgpu::Operations {
+                                                    load: wgpu::LoadOp::Load,
+                                                    store: wgpu::StoreOp::Store,
+                                                },
+                                                depth_slice: None,
+                                            },
+                                        )],
+                                        depth_stencil_attachment: None,
+                                        ..Default::default()
+                                    });
                                 }
-                                self.encode_blit(&mut encoder, &frame_view);
-                                blitted = true;
-                                target_view = &frame_view;
-                                pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                    label: Some("chrome_pass"),
-                                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                        view: target_view,
-                                        resolve_target: None,
-                                        ops: wgpu::Operations {
-                                            load: wgpu::LoadOp::Load,
-                                            store: wgpu::StoreOp::Store,
-                                        },
-                                        depth_slice: None,
-                                    })],
-                                    depth_stencil_attachment: None,
-                                    ..Default::default()
-                                });
+                                self.draw_glass_panels(
+                                    &scene.glass_panels[range],
+                                    &mut glass_drawn,
+                                    &mut instance_offset,
+                                    &mut pass,
+                                )
                             }
-                            self.draw_glass_panels(
-                                &scene.glass_panels[range],
-                                &mut instance_offset,
-                                &mut pass,
-                            )
                         }
                     };
                     if !ok {
@@ -1937,25 +2004,17 @@ impl WgpuRenderer {
         }
     }
 
-    /// G4: glass panels composite the blurred backdrop with the full
-    /// optics stack (fs_glass_panel), with `effect::SHADOW_FLOAT`
-    /// rendered beneath via the existing shadows pipeline. Falls back to
-    /// the G2 solid mapping if the blur pyramid is unavailable — the G5
-    /// fallback path.
-    fn draw_glass_panels(
+    /// SHADOW_FLOAT beneath each panel (tokens.rs effect::SHADOW_FLOAT =
+    /// (dx 0, dy 10, blur 30, alpha .45), black). Rendered on BOTH the
+    /// glass and the solid path — the zero-layout-shift contract says
+    /// the fallback pair may differ only inside panel interiors, so the
+    /// shadow must never appear/disappear with the toggle.
+    fn draw_glass_panel_shadows(
         &self,
         panels: &[GlassPanel],
         instance_offset: &mut u64,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> bool {
-        let resources = self.resources();
-        if resources.blur_half_a_view.is_none() {
-            let quads: Vec<Quad> = panels.iter().map(|panel| panel.solid_quad()).collect();
-            return self.draw_quads(&quads, instance_offset, pass);
-        }
-
-        // SHADOW_FLOAT beneath (tokens.rs effect::SHADOW_FLOAT =
-        // (dx 0, dy 10, blur 30, alpha .45), black).
         let shadows: Vec<Shadow> = panels
             .iter()
             .map(|panel| {
@@ -1981,30 +2040,89 @@ impl WgpuRenderer {
                 }
             })
             .collect();
-        if !self.draw_shadows(&shadows, instance_offset, pass) {
+        self.draw_shadows(&shadows, instance_offset, pass)
+    }
+
+    /// G5: the solid-mapping branch — shadow + plain quads. Used when
+    /// the glass pass is off (set_glass_enabled / GEM_GLASS_OFF), when
+    /// the blur pyramid is unavailable, and for over-budget panels in
+    /// release builds.
+    fn draw_glass_panels_solid(
+        &self,
+        panels: &[GlassPanel],
+        instance_offset: &mut u64,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> bool {
+        if panels.is_empty() {
+            return true;
+        }
+        if !self.draw_glass_panel_shadows(panels, instance_offset, pass) {
+            return false;
+        }
+        let quads: Vec<Quad> = panels.iter().map(|panel| panel.solid_quad()).collect();
+        self.draw_quads(&quads, instance_offset, pass)
+    }
+
+    /// G4: glass panels composite the blurred backdrop with the full
+    /// optics stack (fs_glass_panel), with `effect::SHADOW_FLOAT`
+    /// rendered beneath via the existing shadows pipeline. Panels beyond
+    /// the G5 budget (`glass_drawn` ≥ GLASS_MAX_SURFACES) render the
+    /// solid mapping instead; the blur-pyramid-missing case falls back
+    /// entirely.
+    fn draw_glass_panels(
+        &self,
+        panels: &[GlassPanel],
+        glass_drawn: &mut usize,
+        instance_offset: &mut u64,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> bool {
+        let resources = self.resources();
+        if resources.blur_half_a_view.is_none() {
+            return self.draw_glass_panels_solid(panels, instance_offset, pass);
+        }
+
+        // G5 budget split: the first GLASS_MAX_SURFACES panels (by draw
+        // order, across batches) composite; the rest go solid.
+        let budget_left = GLASS_MAX_SURFACES.saturating_sub(*glass_drawn);
+        let (glass_part, solid_part) = panels.split_at(budget_left.min(panels.len()));
+        *glass_drawn += glass_part.len();
+
+        if !self.draw_glass_panel_shadows(panels, instance_offset, pass) {
             return false;
         }
 
-        // The spare `pad` field carries the refraction strength (f32
-        // bits) so the shader reads the env-tunable value without a
-        // dedicated uniform (GEM_REFRACT_STRENGTH_PT; 0 disables).
-        let mut panels_data = panels.to_vec();
-        let strength_bits = self.rendering_params.refract_strength_pt.to_bits();
-        for panel in &mut panels_data {
-            panel.pad = strength_bits;
+        if !glass_part.is_empty() {
+            // The spare `pad` field carries the refraction strength (f32
+            // bits) so the shader reads the env-tunable value without a
+            // dedicated uniform (GEM_REFRACT_STRENGTH_PT; 0 disables).
+            let mut panels_data = glass_part.to_vec();
+            let strength_bits = self.rendering_params.refract_strength_pt.to_bits();
+            for panel in &mut panels_data {
+                panel.pad = strength_bits;
+            }
+
+            let resources = self.resources();
+            let blur_view = resources.blur_half_a_view.as_ref().expect("checked above");
+            let data = unsafe { Self::instance_bytes(&panels_data) };
+            if !self.draw_instances_with_texture(
+                data,
+                panels_data.len() as u32,
+                blur_view,
+                &resources.pipelines.glass_composite,
+                instance_offset,
+                pass,
+            ) {
+                return false;
+            }
         }
 
-        let resources = self.resources();
-        let blur_view = resources.blur_half_a_view.as_ref().expect("checked above");
-        let data = unsafe { Self::instance_bytes(&panels_data) };
-        self.draw_instances_with_texture(
-            data,
-            panels_data.len() as u32,
-            blur_view,
-            &resources.pipelines.glass_composite,
-            instance_offset,
-            pass,
-        )
+        if !solid_part.is_empty() {
+            let quads: Vec<Quad> = solid_part.iter().map(|panel| panel.solid_quad()).collect();
+            if !self.draw_quads(&quads, instance_offset, pass) {
+                return false;
+            }
+        }
+        true
     }
 
     fn draw_quads(
@@ -2439,6 +2557,16 @@ impl WgpuRenderer {
     /// Calling this method clears the flag.
     pub fn needs_redraw(&mut self) -> bool {
         std::mem::take(&mut self.needs_redraw)
+    }
+
+    /// G5: toggle the glass pass. `enabled = false` forces every glass
+    /// panel down the solid-mapping branch and skips the blur chain
+    /// entirely — the hook for the app's 0i triggers
+    /// (reduce-transparency, thermal, low-power). The pair must differ
+    /// only inside panel interiors (zero layout shift); geometry,
+    /// after-content, and the SHADOW_FLOAT are identical on both paths.
+    pub fn set_glass_enabled(&mut self, enabled: bool) {
+        self.glass_off = !enabled;
     }
 
     /// Recovers from a lost GPU device by recreating the renderer with a new context.
