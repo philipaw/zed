@@ -54,6 +54,31 @@ struct GammaParams {
     _pad: u32,
 }
 
+/// G-tune: env-driven glass-composite optics (matches WGSL GlassTuning).
+/// Each field is populated once from a `GEM_GLASS_*` env var (default =
+/// the token const) so the glass optics can be dialed live without a
+/// rebuild — the ZED_FONTS_GAMMA / GEM_REFRACT_STRENGTH_PT pattern.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct GlassTuning {
+    saturation: f32,
+    border_alpha: f32,
+    highlight_alpha: f32,
+    highlight_stop: f32,
+    edge_glow_top: f32,
+    edge_glow_bottom: f32,
+    edge_glow_sides: f32,
+    edge_glow_soft_pt: f32,
+    rim_alpha_top: f32,
+    rim_alpha_bottom: f32,
+    adapt_alpha: f32,
+    adapt_luma_lo: f32,
+    adapt_luma_hi: f32,
+    adapt_alpha_cap: f32,
+    refract_band_pt: f32,
+    _pad: f32,
+}
+
 /// G3: per-pass uniform of the blur chain (matches WGSL BlurParams).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -205,6 +230,7 @@ pub struct WgpuRenderer {
     atlas: Arc<WgpuAtlas>,
     path_globals_offset: u64,
     gamma_offset: u64,
+    glass_tuning_offset: u64,
     instance_buffer_capacity: u64,
     max_buffer_size: u64,
     storage_buffer_alignment: u64,
@@ -455,10 +481,12 @@ impl WgpuRenderer {
         let gamma_size = std::mem::size_of::<GammaParams>() as u64;
         let path_globals_offset = globals_size.next_multiple_of(uniform_alignment);
         let gamma_offset = (path_globals_offset + globals_size).next_multiple_of(uniform_alignment);
+        let glass_tuning_size = std::mem::size_of::<GlassTuning>() as u64;
+        let glass_tuning_offset = (gamma_offset + gamma_size).next_multiple_of(uniform_alignment);
 
         let globals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("globals_buffer"),
-            size: gamma_offset + gamma_size,
+            size: glass_tuning_offset + glass_tuning_size,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -493,6 +521,14 @@ impl WgpuRenderer {
                         size: Some(NonZeroU64::new(gamma_size).unwrap()),
                     }),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &globals_buffer,
+                        offset: glass_tuning_offset,
+                        size: Some(NonZeroU64::new(glass_tuning_size).unwrap()),
+                    }),
+                },
             ],
         });
 
@@ -514,6 +550,14 @@ impl WgpuRenderer {
                         buffer: &globals_buffer,
                         offset: gamma_offset,
                         size: Some(NonZeroU64::new(gamma_size).unwrap()),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &globals_buffer,
+                        offset: glass_tuning_offset,
+                        size: Some(NonZeroU64::new(glass_tuning_size).unwrap()),
                     }),
                 },
             ],
@@ -566,6 +610,7 @@ impl WgpuRenderer {
             atlas,
             path_globals_offset,
             gamma_offset,
+            glass_tuning_offset,
             instance_buffer_capacity: initial_instance_buffer_capacity,
             max_buffer_size,
             storage_buffer_alignment,
@@ -613,6 +658,18 @@ impl WgpuRenderer {
                             has_dynamic_offset: false,
                             min_binding_size: NonZeroU64::new(
                                 std::mem::size_of::<GammaParams>() as u64
+                            ),
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: NonZeroU64::new(
+                                std::mem::size_of::<GlassTuning>() as u64
                             ),
                         },
                         count: None,
@@ -1671,6 +1728,11 @@ impl WgpuRenderer {
                 self.gamma_offset,
                 bytemuck::bytes_of(&gamma_params),
             );
+            resources.queue.write_buffer(
+                &resources.globals_buffer,
+                self.glass_tuning_offset,
+                bytemuck::bytes_of(&self.rendering_params.glass_tuning),
+            );
         }
 
         loop {
@@ -2681,6 +2743,9 @@ struct RenderingParameters {
     /// D4 device tuning both use. Carried to the shader per panel in
     /// the spare `pad` field (f32 bits).
     refract_strength_pt: f32,
+    /// G-tune: env-driven glass-composite optics, bound at
+    /// `@group(0) @binding(2)` and consumed by `fs_glass_panel`.
+    glass_tuning: GlassTuning,
 }
 
 impl RenderingParameters {
@@ -2730,6 +2795,88 @@ impl RenderingParameters {
             .unwrap_or(6.0_f32)
             .clamp(0.0, 24.0);
 
+        // G-tune: each glass optic reads a GEM_GLASS_* env var, defaults to
+        // the token const, and is clamped to a sane range — dial live, no
+        // rebuild (the ZED_FONTS_GAMMA pattern).
+        let glass_tuning = GlassTuning {
+            saturation: env::var("GEM_GLASS_SATURATION")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1.8_f32)
+                .clamp(0.0, 4.0),
+            border_alpha: env::var("GEM_GLASS_BORDER_ALPHA")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.10_f32)
+                .clamp(0.0, 1.0),
+            highlight_alpha: env::var("GEM_GLASS_HIGHLIGHT_ALPHA")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.08_f32)
+                .clamp(0.0, 1.0),
+            highlight_stop: env::var("GEM_GLASS_HIGHLIGHT_STOP")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.34_f32)
+                .clamp(0.01, 1.0),
+            edge_glow_top: env::var("GEM_GLASS_EDGE_GLOW_TOP")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.52_f32)
+                .clamp(0.0, 1.0),
+            edge_glow_bottom: env::var("GEM_GLASS_EDGE_GLOW_BOTTOM")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.34_f32)
+                .clamp(0.0, 1.0),
+            edge_glow_sides: env::var("GEM_GLASS_EDGE_GLOW_SIDES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.30_f32)
+                .clamp(0.0, 1.0),
+            edge_glow_soft_pt: env::var("GEM_GLASS_EDGE_GLOW_SOFT_PT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(22.0_f32)
+                .clamp(0.0, 128.0),
+            rim_alpha_top: env::var("GEM_GLASS_RIM_ALPHA_TOP")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.55_f32)
+                .clamp(0.0, 1.0),
+            rim_alpha_bottom: env::var("GEM_GLASS_RIM_ALPHA_BOTTOM")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.22_f32)
+                .clamp(0.0, 1.0),
+            adapt_alpha: env::var("GEM_GLASS_ADAPT_ALPHA")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.35_f32)
+                .clamp(0.0, 1.0),
+            adapt_luma_lo: env::var("GEM_GLASS_ADAPT_LUMA_LO")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.55_f32)
+                .clamp(0.0, 1.0),
+            adapt_luma_hi: env::var("GEM_GLASS_ADAPT_LUMA_HI")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.95_f32)
+                .clamp(0.0, 1.0),
+            adapt_alpha_cap: env::var("GEM_GLASS_ADAPT_ALPHA_CAP")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.90_f32)
+                .clamp(0.0, 1.0),
+            refract_band_pt: env::var("GEM_GLASS_REFRACT_BAND_PT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10.0_f32)
+                .clamp(0.0, 64.0),
+            _pad: 0.0,
+        };
+
         Self {
             path_sample_count,
             gamma_ratios,
@@ -2738,6 +2885,7 @@ impl RenderingParameters {
             blur_offset_down,
             blur_offset_up,
             refract_strength_pt,
+            glass_tuning,
         }
     }
 }

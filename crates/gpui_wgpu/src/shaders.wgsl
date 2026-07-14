@@ -1460,6 +1460,30 @@ struct GlassPanel {
 
 @group(1) @binding(0) var<storage, read> b_glass_panels: array<GlassPanel>;
 
+// G-tune: env-driven glass optics (matches Rust GlassTuning, 16 f32).
+// The `const GLASS_*` below stay as documentation of the token defaults;
+// fs_glass_panel reads these uniform fields instead so GEM_GLASS_* can
+// retune without a rebuild.
+struct GlassTuning {
+    saturation: f32,
+    border_alpha: f32,
+    highlight_alpha: f32,
+    highlight_stop: f32,
+    edge_glow_top: f32,
+    edge_glow_bottom: f32,
+    edge_glow_sides: f32,
+    edge_glow_soft_pt: f32,
+    rim_alpha_top: f32,
+    rim_alpha_bottom: f32,
+    adapt_alpha: f32,
+    adapt_luma_lo: f32,
+    adapt_luma_hi: f32,
+    adapt_alpha_cap: f32,
+    refract_band_pt: f32,
+    _pad: f32,
+}
+@group(0) @binding(2) var<uniform> glass_tuning: GlassTuning;
+
 // tokens.rs glass:: (rgb components pre-divided by 255)
 const GLASS_FILL: vec4<f32> = vec4<f32>(0.09412, 0.10196, 0.12941, 0.40); // 0x181A21 @ .40
 const GLASS_FILL_STRONG: vec4<f32> = vec4<f32>(0.06667, 0.07451, 0.09804, 0.55); // 0x111319 @ .55
@@ -1532,7 +1556,7 @@ fn fs_glass_panel(input: GlassPanelVarying) -> @location(0) vec4<f32> {
 
     // 2. Edge refraction: displace the backdrop sample along the SDF
     // gradient inside the band, quadratic ease-in toward the rim.
-    let band = GLASS_REFRACT_BAND_PT * scale;
+    let band = glass_tuning.refract_band_pt * scale;
     let ease = saturate(1.0 + d / band);
     // Strength arrives per panel in the spare `pad` field (f32 bits) so
     // GEM_REFRACT_STRENGTH_PT tunes it without a rebuild; the token
@@ -1544,28 +1568,28 @@ fn fs_glass_panel(input: GlassPanelVarying) -> @location(0) vec4<f32> {
 
     // 3. Saturation boost.
     let luma = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
-    c = clamp(mix(vec3<f32>(luma), c, GLASS_SATURATION), vec3<f32>(0.0), vec3<f32>(1.0));
+    c = clamp(mix(vec3<f32>(luma), c, glass_tuning.saturation), vec3<f32>(0.0), vec3<f32>(1.0));
 
     // 4. FILL / FILL_STRONG overlay, luminance-adaptive over bright
     // backdrops.
     let fill = select(GLASS_FILL, GLASS_FILL_STRONG, panel.strong != 0u);
-    let adapt = GLASS_ADAPT_ALPHA * smoothstep(GLASS_ADAPT_LUMA_LO, GLASS_ADAPT_LUMA_HI, luma);
-    let fill_a = min(fill.a + adapt, GLASS_ADAPT_ALPHA_CAP);
+    let adapt = glass_tuning.adapt_alpha * smoothstep(glass_tuning.adapt_luma_lo, glass_tuning.adapt_luma_hi, luma);
+    let fill_a = min(fill.a + adapt, glass_tuning.adapt_alpha_cap);
     c = mix(c, fill.rgb, fill_a);
 
     // 5. Highlight: top white gradient.
     let hy = saturate((pos.y - panel.bounds.origin.y) / max(panel.bounds.size.y, 1.0));
-    let highlight = GLASS_HIGHLIGHT_ALPHA * saturate(1.0 - hy / GLASS_HIGHLIGHT_STOP);
+    let highlight = glass_tuning.highlight_alpha * saturate(1.0 - hy / glass_tuning.highlight_stop);
     c = mix(c, vec3<f32>(1.0), highlight);
 
     // 6. Edge glow: light collects at the rim (cubic falloff inward
     // over the softness band; alpha by nearest-edge orientation).
-    let glow_soft = GLASS_EDGE_GLOW_SOFT_PT * scale;
-    var glow_alpha = GLASS_EDGE_GLOW_SIDES;
+    let glow_soft = glass_tuning.edge_glow_soft_pt * scale;
+    var glow_alpha = glass_tuning.edge_glow_sides;
     if (grad.y < -0.7) {
-        glow_alpha = GLASS_EDGE_GLOW_TOP;
+        glow_alpha = glass_tuning.edge_glow_top;
     } else if (grad.y > 0.7) {
-        glow_alpha = GLASS_EDGE_GLOW_BOTTOM;
+        glow_alpha = glass_tuning.edge_glow_bottom;
     }
     let glow_t = saturate(1.0 + d / glow_soft);
     let glow = glow_alpha * glow_t * glow_t * glow_t;
@@ -1575,14 +1599,14 @@ fn fs_glass_panel(input: GlassPanelVarying) -> @location(0) vec4<f32> {
     let rim_w = GLASS_RIM_WIDTH_PT * scale;
     var rim = 0.0;
     if (d > -(rim_w + 0.5)) {
-        rim = mix(GLASS_RIM_ALPHA_TOP, GLASS_RIM_ALPHA_BOTTOM, hy);
+        rim = mix(glass_tuning.rim_alpha_top, glass_tuning.rim_alpha_bottom, hy);
     }
     c = mix(c, vec3<f32>(1.0), rim);
 
     // 8. 1px border white@.10 (inner ring just inside the rim).
     var border = 0.0;
     if (d > -(rim_w + 1.0 + 0.5) && d <= -(rim_w + 0.5)) {
-        border = GLASS_BORDER_ALPHA;
+        border = glass_tuning.border_alpha;
     }
     c = mix(c, vec3<f32>(1.0), border);
 
