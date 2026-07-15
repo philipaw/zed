@@ -2631,6 +2631,28 @@ impl WgpuRenderer {
         self.glass_off = !enabled;
     }
 
+    /// Live glass-tuning override (gem D4 debug panel). Maps the 15-param
+    /// array into `rendering_params.glass_tuning`, which the per-frame
+    /// glass-uniform write already reads.
+    pub fn set_glass_tuning(&mut self, v: [f32; 15]) {
+        let t = &mut self.rendering_params.glass_tuning;
+        t.saturation = v[0];
+        t.border_alpha = v[1];
+        t.highlight_alpha = v[2];
+        t.highlight_stop = v[3];
+        t.edge_glow_top = v[4];
+        t.edge_glow_bottom = v[5];
+        t.edge_glow_sides = v[6];
+        t.edge_glow_soft_pt = v[7];
+        t.rim_alpha_top = v[8];
+        t.rim_alpha_bottom = v[9];
+        t.adapt_alpha = v[10];
+        t.adapt_luma_lo = v[11];
+        t.adapt_luma_hi = v[12];
+        t.adapt_alpha_cap = v[13];
+        t.refract_band_pt = v[14];
+    }
+
     /// Recovers from a lost GPU device by recreating the renderer with a new context.
     ///
     /// Call this after detecting `device_lost()` returns true.
